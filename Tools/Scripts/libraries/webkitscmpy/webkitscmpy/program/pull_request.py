@@ -31,6 +31,7 @@ from .commit import Commit
 from .branch import Branch
 from .install_hooks import InstallHooks
 from .squash import Squash
+from .stack import Stack
 
 from webkitbugspy import Tracker, radar
 from webkitcorepy import arguments, run, string_utils, Terminal, OutputCapture
@@ -286,6 +287,15 @@ class PullRequest(Command):
             source_remote = repository.source_remotes()[-1]
             args.remote = source_remote
 
+        if args.stacked_on:
+            args._new_parent = Stack.resolve(
+                repository, args.stacked_on,
+                remote_repo=repository.remote(name=source_remote),
+                branch=repository.branch,
+            )
+            if not args._new_parent:
+                return None
+
         if not repository.is_suitable_branch_for_pull_request(repository.branch, source_remote):
             if not args.issue:
                 args.issue = cls.issue_from_commits(repository, source_remote, branch_point)
@@ -472,6 +482,44 @@ class PullRequest(Command):
             print('Posted pull request link to {}'.format(issue.link))
 
     @classmethod
+    def ensure_stack_parent(cls, args, repository):
+        """The branch this one is stacked on, recording and replaying onto a newly provided one."""
+        stack_parent = Stack.parent(repository, repository.branch)
+
+        # 'pull_request_branch_point' resolved '--stacked-on' once the source remote was known
+        new_parent = getattr(args, '_new_parent', None)
+        if not new_parent:
+            return stack_parent, 0
+
+        if stack_parent and stack_parent != new_parent:
+            log.warning(
+                f"'{repository.branch}' was stacked on '{stack_parent}', stacking it on '{new_parent}' instead\n"
+                f"Any issue dependency recorded for '{stack_parent}' must be removed by hand"
+            )
+        if Stack.stack_on(repository, repository.branch, new_parent):
+            return None, 1
+        return new_parent, 0
+
+    @classmethod
+    def commit_base_for(cls, repository, stack_parent, branch_point):
+        """The commit a pull-request's commits are counted from, which is its parent's tip when stacked."""
+        if not stack_parent:
+            return branch_point, 0
+
+        commit_base = repository.commit(branch=stack_parent, include_log=False, include_identifier=False)
+        if not commit_base:
+            sys.stderr.write(f"Failed to resolve the tip of '{stack_parent}'\n")
+            return None, 1
+
+        command = [repository.executable(), 'merge-base', '--is-ancestor', commit_base.hash, repository.branch]
+        if run(command, cwd=repository.root_path, capture_output=True).returncode:
+            tool = os.path.basename(sys.argv[0])
+            sys.stderr.write(f"'{repository.branch}' no longer sits on top of '{stack_parent}'\n")
+            sys.stderr.write(f"Run '{tool} stack --rebase' or '{tool} {cls.name} --rebase' to replay it\n")
+            return None, 1
+        return commit_base, 0
+
+    @classmethod
     def create_pull_request(cls, repository, args, branch_point, callback=None, unblock=True, update_issue=None):
         if update_issue is None:
             update_issue = getattr(args, 'update_issue', True)
@@ -485,7 +533,15 @@ class PullRequest(Command):
             repository.config().get('pull.rebase', 'true'),
         ) == 'true'
 
-        if rebasing:
+        stack_parent, result = cls.ensure_stack_parent(args, repository)
+        if result:
+            return result
+
+        if rebasing and stack_parent:
+            if Stack.rebase(repository, remote=source_remote):
+                return 1
+            branch_point = repository.commit(branch=f'{source_remote}/{branch_point.branch}')
+        elif rebasing:
             log.info("Rebasing '{}' on '{}'...".format(repository.branch, branch_point.branch))
             if repository.pull(rebase=True, branch=branch_point.branch, remote=source_remote):
                 sys.stderr.write("Failed to rebase '{}' on '{},' please resolve conflicts\n".format(repository.branch, branch_point.branch))
@@ -499,7 +555,14 @@ class PullRequest(Command):
             sys.stderr.write('Checks have failed, aborting pull request.\n')
             return 1
 
-        commits = list(repository.commits(begin=dict(hash=branch_point.hash), end=dict(branch=repository.branch)))
+        commit_base, result = cls.commit_base_for(repository, stack_parent, branch_point)
+        if result:
+            return result
+
+        commits = list(repository.commits(begin={'hash': commit_base.hash}, end={'branch': repository.branch}))
+        if stack_parent and not commits:
+            sys.stderr.write(f"'{repository.branch}' does not contain any commits which '{stack_parent}' does not\n")
+            return 1
         issues = [
             issue
             for commit in commits
@@ -524,7 +587,7 @@ class PullRequest(Command):
                 if run([repository.executable(), 'commit', '--amend', '-m', cleaned], cwd=repository.root_path).returncode:
                     sys.stderr.write("Failed to amend commit message\n")
                     return 1
-                commits = list(repository.commits(begin={'hash': branch_point.hash}, end={'branch': repository.branch}))
+                commits = list(repository.commits(begin={'hash': commit_base.hash}, end={'branch': repository.branch}))
 
         radar_issue = next(iter(filter(lambda issue: isinstance(issue.tracker, radar.Tracker), issues)), None)
         not_radar = next(iter(filter(lambda issue: not isinstance(issue.tracker, radar.Tracker), issues)), None)
@@ -764,12 +827,18 @@ class PullRequest(Command):
         if args.update_title is None:
             args.update_title = repository.config().get('webkitscmpy.update-title', 'true') == 'true'
 
+        stack_lines = Stack.describe(repository, repository.branch, remote_repo=remote_repo)
+        if stack_lines is None:
+            return 1
+        stack_body = '\n'.join(stack_lines) if stack_lines else None
+
         if existing_pr:
             log.info("Updating pull-request for '{}'...".format(repository.branch))
             pr = remote_repo.pull_requests.update(
                 pull_request=existing_pr,
                 title=cls.title_for(commits) if args.update_title else existing_pr.title,
                 commits=commits,
+                body=stack_body,
                 base=branch_point.branch,
                 head=repository.branch,
                 opened=None if existing_pr.opened else True,
@@ -787,6 +856,7 @@ class PullRequest(Command):
             pr = remote_repo.pull_requests.create(
                 title=cls.title_for(commits),
                 commits=commits,
+                body=stack_body,
                 base=branch_point.branch,
                 head=repository.branch,
                 draft=args.draft,
@@ -797,6 +867,9 @@ class PullRequest(Command):
             print("Created '{}'!".format(pr))
             if cls.is_revert_commit(commits[0]) and update_issue:
                 cls.add_comment_to_reverted_commit_bug_tracker(repository, args, pr, commits[0])
+
+        if stack_body:
+            print(stack_body)
 
         commit_class = None
         if repository.classifier and repository.classifier.classes and commits:

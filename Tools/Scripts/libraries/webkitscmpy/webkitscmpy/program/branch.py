@@ -25,6 +25,7 @@ import sys
 
 from .command import Command
 from .commit import Commit
+from .stack import Stack
 
 from webkitbugspy import Tracker, bugzilla, radar
 from webkitcorepy import arguments, run, string_utils, Terminal
@@ -43,6 +44,12 @@ class Branch(Command):
             '-i', '--issue', '-b', '--bug', '-r',
             dest='issue', type=str,
             help='Number (or name) of the issue or bug to create branch for',
+        )
+        parser.add_argument(
+            '--on', '--stacked-on',
+            dest='stacked_on', type=str, default=None,
+            help='Stack this change on an existing development branch, which may be named by a '
+                 'pull-request or issue instead of by branch name',
         )
         parser.add_argument(
             '-d', '--delete-existing', '--no-delete-existing',
@@ -202,6 +209,13 @@ class Branch(Command):
             sys.stderr.write("Can only 'branch' on a native Git repository\n")
             return 1
 
+        parent = None
+        if getattr(args, 'stacked_on', None):
+            remote_repo = repository.remote(name=repository.default_remote)
+            parent = Stack.resolve(repository, args.stacked_on, remote_repo=remote_repo)
+            if not parent:
+                return 1
+
         issue, result = cls.ensure_issue(args, repository, why=why, redact=redact)
         if result:
             return result
@@ -233,6 +247,19 @@ class Branch(Command):
                     return 1
 
         if args.issue in repository.branches_for(remote=False):
+            if parent and not args.delete_existing:
+                log.info(f"Stacking local development branch '{args.issue}' on '{parent}'")
+                command = [repository.executable(), 'checkout', args.issue]
+                if run(command, cwd=repository.root_path, capture_output=True).returncode:
+                    sys.stderr.write(f"Failed to check out '{args.issue}'\n")
+                    return 1
+
+                repository._branch = args.issue  # Assign the cache because of repository.branch's caching
+                if Stack.stack_on(repository, args.issue, parent):
+                    return 1
+                print(f"Stacked the local development branch '{args.issue}' on '{parent}'")
+                return 0
+
             if args.delete_existing:
                 log.info("Locally deleting existing branch '{}'".format(args.issue))
                 if run([repository.executable(), 'branch', '-D', args.issue], cwd=repository.root_path).returncode:
@@ -248,9 +275,14 @@ class Branch(Command):
                 return 1
 
         log.info("Creating the local development branch '{}'...".format(args.issue))
-        if run([repository.executable(), 'checkout', '-b', args.issue], cwd=repository.root_path).returncode:
+        command = [repository.executable(), 'checkout', '-b', args.issue] + ([parent] if parent else [])
+        if run(command, cwd=repository.root_path).returncode:
             sys.stderr.write("Failed to create '{}'\n".format(args.issue))
             return 1
+
         repository._branch = args.issue  # Assign the cache because of repository.branch's caching
-        print("Created the local development branch '{}'".format(args.issue))
+        if parent and Stack.stack_on(repository, args.issue, parent):
+            return 1
+        stacked = f" stacked on '{parent}'" if parent else ''
+        print(f"Created the local development branch '{args.issue}'{stacked}")
         return 0

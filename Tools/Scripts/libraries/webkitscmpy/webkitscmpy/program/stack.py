@@ -41,6 +41,7 @@ class Stack(Command):
     BASE_KEY = 'stack-base'
     HEADER = 'Stacked pull requests, bottom of the stack first:'
     UPDATE_REFS_VERSION = Version(2, 38)
+    PULL_REQUEST_RE = re.compile(r'(?:^|/pull/)(?P<number>\d+)(?:/|$)')
 
     @classmethod
     def parser(cls, parser, loggers=None):
@@ -51,7 +52,8 @@ class Stack(Command):
         parser.add_argument(
             '--on', '--stacked-on',
             dest='parent', type=str, default=None,
-            help='Record that the current development branch is stacked on the provided branch',
+            help='Stack the current development branch on the provided branch, pull-request or issue, '
+                 'replaying it onto that branch if it does not already sit on top of it',
         )
         parser.add_argument(
             '--unstack',
@@ -60,7 +62,8 @@ class Stack(Command):
         )
         parser.add_argument(
             '--remote', dest='remote', type=str, default=None,
-            help='Rebase the bottom of the stack on the production branch of the provided remote',
+            help="Look up the stack's pull-requests on the provided remote, and rebase the bottom "
+                 "of the stack on that remote's production branch",
         )
 
     @classmethod
@@ -85,7 +88,7 @@ class Stack(Command):
         return 0
 
     @classmethod
-    def _parent(cls, git, branch):
+    def parent(cls, git, branch):
         if not isinstance(git, local.Git) or not branch:
             return None
 
@@ -105,7 +108,7 @@ class Stack(Command):
             sys.stderr.write(f"Failed to record that '{branch}' is stacked on '{parent}'\n")
             return 1
         git.config(cached=False)
-        return cls._set_base(git, branch, parent)
+        return 0
 
     @classmethod
     def _unset_parent(cls, git, branch):
@@ -118,26 +121,6 @@ class Stack(Command):
         return 0
 
     @classmethod
-    def _resolve_parent(cls, git, candidate, branch=None):
-        from .branch import Branch
-
-        branches = git.branches_for(remote=False)
-        if candidate not in branches:
-            candidate = Branch.normalize_branch_name(candidate, repository=git)
-            if candidate not in branches:
-                sys.stderr.write(f"'{candidate}' does not exist in this checkout\n")
-                return None
-
-        if not git.dev_branches.match(candidate):
-            sys.stderr.write(f"'{candidate}' is not a development branch, a branch cannot be stacked on it\n")
-            return None
-
-        if candidate == branch:
-            sys.stderr.write(f"'{branch}' cannot be stacked on itself\n")
-            return None
-        return candidate
-
-    @classmethod
     def _children(cls, git, branch):
         prefix, suffix = 'branch.', f'.{cls.PARENT_KEY}'
         result = []
@@ -145,7 +128,7 @@ class Stack(Command):
             if value != branch or not key.startswith(prefix) or not key.endswith(suffix):
                 continue
             candidate = key[len(prefix):-len(suffix)]
-            if cls._parent(git, candidate) == branch:
+            if cls.parent(git, candidate) == branch:
                 result.append(candidate)
         return sorted(result)
 
@@ -153,7 +136,7 @@ class Stack(Command):
     def _ancestors(cls, git, branch):
         result = []
         candidate = branch
-        while candidate := cls._parent(git, candidate):
+        while candidate := cls.parent(git, candidate):
             if candidate == branch or candidate in result:
                 sys.stderr.write(f"'{candidate}' is part of a cycle of stacked branches\n")
                 return None
@@ -194,7 +177,7 @@ class Stack(Command):
         return PullRequest.find_existing_pull_request(git, remote_repo, branch=branch)
 
     @classmethod
-    def _describe(cls, git, branch, remote_repo=None):
+    def describe(cls, git, branch, remote_repo=None):
         if (members := cls.members(git, branch)) is None:
             return None
         if len(members) < 2:
@@ -203,7 +186,7 @@ class Stack(Command):
         depth = {}
         lines = [cls.HEADER]
         for member in members:
-            depth[member] = depth.get(cls._parent(git, member), -1) + 1
+            depth[member] = depth.get(cls.parent(git, member), -1) + 1
             pull_request = cls._pull_request_for(git, member, remote_repo)
 
             annotations = []
@@ -247,7 +230,7 @@ class Stack(Command):
         update_refs = cls._supports_update_refs(git)
 
         for member in members:
-            parent = cls._parent(git, member)
+            parent = cls.parent(git, member)
             is_first_child = result and result[-1].branch == parent
 
             if update_refs and is_first_child and cls._is_contiguous(git, member, parent):
@@ -285,10 +268,14 @@ class Stack(Command):
         plan = cls._rebase_plan(git, members, trunk, branch_point)
         for step in plan:
             if cls._rebase_onto(git, step):
+                sys.stderr.write(
+                    f"Then run 'git rebase --continue' followed by "
+                    f"'{os.path.basename(sys.argv[0])} stack --rebase' to replay the rest of the stack\n"
+                )
                 return 1
 
         for member in members[1:]:
-            if cls._set_base(git, member, cls._parent(git, member)):
+            if cls._set_base(git, member, cls.parent(git, member)):
                 return 1
 
         # CLEANUP
@@ -307,12 +294,115 @@ class Stack(Command):
 
         if run(command, cwd=git.root_path).returncode:
             sys.stderr.write(f"Failed to rebase '{step.branch}' on '{step.onto},' please resolve conflicts\n")
-            sys.stderr.write(
-                f"Then run 'git rebase --continue' followed by "
-                f"'{os.path.basename(sys.argv[0])} stack --rebase' to replay the rest of the stack\n"
-            )
             return 1
         return 0
+
+    @classmethod
+    def pull_request_number(cls, argument):
+        match = cls.PULL_REQUEST_RE.search(str(argument))
+        return int(match.group('number')) if match else None
+
+    @classmethod
+    def _branch_for_pull_request(cls, git, remote_repo, number, branch=None):
+        """The local branch a pull-request is from, and 1 if it exists but cannot be stacked on."""
+        if not remote_repo or not remote_repo.pull_requests:
+            log.warning(f"Cannot look up pull-request #{number}, '{git.root_path}' has no remote which tracks them")
+            return None, 0
+        if not (pull_request := remote_repo.pull_requests.get(number)):
+            return None, 0
+
+        if pull_request.merged:
+            sys.stderr.write(f"'{pull_request}' has already been merged, there is nothing to stack on\n")
+            return None, 1
+        if not pull_request.head:
+            sys.stderr.write(f"Failed to determine which branch '{pull_request}' is from\n")
+            return None, 1
+        if pull_request.head not in git.branches_for(remote=False):
+            sys.stderr.write(f"'{pull_request}' is from '{pull_request.head},' which does not exist in this checkout\n")
+            sys.stderr.write(f"Fetch that branch before stacking '{branch or git.branch}' on it\n")
+            return None, 1
+        return pull_request.head, 0
+
+    @classmethod
+    def _branch_for_issue(cls, git, argument):
+        """The local branch recorded against an issue, matched on the numbers in its url."""
+        if not (numbers := set(re.findall(r'\d+', str(argument)))):
+            return None
+
+        # 'git config --get-regexp' reports every value, where config() keeps only the last
+        command = [git.executable(), 'config', '--get-regexp', r'branch\..*\.bug']
+        result = run(command, cwd=git.root_path, capture_output=True, encoding='utf-8')
+        if result.returncode:
+            return None
+
+        prefix, suffix = 'branch.', '.bug'
+        matches = set()
+        for line in result.stdout.splitlines():
+            key, _, value = line.partition(' ')
+            if not key.startswith(prefix) or not key.endswith(suffix):
+                continue
+            if numbers & set(re.findall(r'\d+', value)):
+                matches.add(key[len(prefix):-len(suffix)])
+
+        if not matches:
+            return None
+        candidate = sorted(matches)[0]  # Sorted so the same argument always picks the same branch
+        if len(matches) > 1:
+            log.warning(f"'{argument}' matches {', '.join(sorted(matches))}, stacking on '{candidate}'")
+        return candidate
+
+    @classmethod
+    def resolve(cls, git, argument, remote_repo=None, branch=None):
+        """The branch in this checkout a branch name, pull-request, or issue refers to."""
+        from .branch import Branch
+
+        branches = git.branches_for(remote=False)
+        candidate = argument if argument in branches else Branch.normalize_branch_name(argument, repository=git)
+
+        # Each lookup is only tried if the ones before it did not already name a branch we have
+        if candidate not in branches:
+            if (number := cls.pull_request_number(argument)) is not None:
+                head, result = cls._branch_for_pull_request(git, remote_repo, number, branch=branch)
+                if result:
+                    return None
+                candidate = head or candidate
+            if candidate not in branches:
+                candidate = cls._branch_for_issue(git, argument) or candidate
+
+        if candidate not in branches:
+            sys.stderr.write(f"Could not find '{argument}' as a branch, pull-request, or issue in this checkout\n")
+            return None
+        if not git.dev_branches.match(candidate):
+            sys.stderr.write(f"'{candidate}' is not a development branch, a branch cannot be stacked on it\n")
+            return None
+        if candidate == branch:
+            sys.stderr.write(f"'{branch}' cannot be stacked on itself\n")
+            return None
+        return candidate
+
+    @classmethod
+    def stack_on(cls, git, branch, parent):
+        """Record that 'branch' is stacked on 'parent,' and put it there."""
+        return cls._set_parent(git, branch, parent) or cls._restack(git, branch, parent)
+
+    @classmethod
+    def _restack(cls, git, branch, parent):
+        command = [git.executable(), 'merge-base', '--is-ancestor', parent, branch]
+        if not run(command, cwd=git.root_path, capture_output=True).returncode:
+            return cls._set_base(git, branch, parent)
+
+        if not (base := cls._base(git, branch)):
+            command = [git.executable(), 'merge-base', parent, branch]
+            result = run(command, cwd=git.root_path, capture_output=True, encoding='utf-8')
+            if result.returncode:
+                sys.stderr.write(f"Failed to find where '{branch}' and '{parent}' diverged\n")
+                return 1
+            base = result.stdout.strip()
+
+        if cls._rebase_onto(git, Rebase(branch, parent, base, False)):
+            sys.stderr.write(f"Then run 'git rebase --continue' to finish stacking '{branch}' on '{parent}'\n")
+            return 1
+        return cls._set_base(git, branch, parent)
 
     @classmethod
     def main(cls, args, repository, **kwargs):
@@ -330,7 +420,8 @@ class Stack(Command):
             if not git.is_suitable_branch_for_pull_request(branch, args.remote or git.default_remote):
                 sys.stderr.write(f"'{branch}' is not a development branch, it cannot be stacked on another branch\n")
                 return 1
-            if not (parent := cls._resolve_parent(git, args.parent, branch=branch)):
+            remote_repo = git.remote(name=args.remote or git.default_remote)
+            if not (parent := cls.resolve(git, args.parent, remote_repo=remote_repo, branch=branch)):
                 return 1
             if (descendants := cls._descendants(git, branch)) is None:
                 return 1
@@ -339,22 +430,25 @@ class Stack(Command):
                     f"'{parent}' is stacked on '{branch},' stacking '{branch}' on it would create a cycle\n"
                 )
                 return 1
-            if cls._set_parent(git, branch, parent):
+            if cls.stack_on(git, branch, parent):
                 return 1
             print(f"'{branch}' is stacked on '{parent}'")
-            return 0
+            return cls.rebase(git, remote=args.remote) if args.rebase else 0
 
         if args.unstack:
+            was_stacked = bool(cls.parent(git, branch))
             if cls._unset_parent(git, branch):
                 return 1
             print(f"'{branch}' is no longer stacked on another branch")
-            return 0
+
+            # Nothing sits beneath it any more, so replay it onto the branch it will be merged into
+            return cls.rebase(git, remote=args.remote) if was_stacked else 0
 
         if args.rebase and (result := cls.rebase(git, remote=args.remote)):
             return result
 
         remote_repo = git.remote(name=args.remote or git.default_remote)
-        if (lines := cls._describe(git, branch, remote_repo=remote_repo)) is None:
+        if (lines := cls.describe(git, branch, remote_repo=remote_repo)) is None:
             return 1
         if not lines:
             print(f"'{branch}' is not part of a stack")

@@ -48,7 +48,7 @@ class Git(mocks.Subprocess):
     #     merge = refs/heads/main
     RE_SINGLE_TOP = re.compile(r'^\[\s*(?P<key>\S+)\s*\]')
     RE_MULTI_TOP = re.compile(r'^\[\s*(?P<keya>\S+) "(?P<keyb>\S+)"\s*\]')
-    RE_ELEMENT = re.compile(r'^\s+(?P<key>\S+)\s*=\s*(?P<value>.*\S+)')
+    RE_ELEMENT = re.compile(r'^\s+(?P<key>[^\s=]+)\s*=\s*(?P<value>.*\S+)')
 
     def __init__(
         self, path='/.invalid-git', datafile=None,
@@ -536,7 +536,10 @@ nothing to commit, working tree clean
                 generator=lambda *args, **kwargs:
                     mocks.ProcessCompletion(
                         returncode=0,
-                        stdout='\n'.join(['{} {}'.format(key, value) for key, value in self.config().items() if key.startswith(args[3])])
+                        stdout='\n'.join([
+                            '{} {}'.format(key, value) for key, value in self.config().items()
+                            if re.match(args[3], key)
+                        ])
                     ),
             ), mocks.Subprocess.Route(
                 self.executable, 'config', '-l', '--file', re.compile(r'.+'),
@@ -993,6 +996,20 @@ nothing to commit, working tree clean
             return mocks.ProcessCompletion(returncode=0, stdout='Updated 1 path from the index')
 
         commit = self.find(source)
+        if create and source != something:
+            if not commit or (something in self.commits and not force):
+                return False
+
+            # Copy source's commits and append the new one
+            self.commits[something] = (self.commits[source][:] if source in self.commits else [])
+            self.commits[something].append(Commit.from_json(Commit.Encoder().default(commit)))
+
+            self.head = self.commits[something][-1]
+            setattr(self.head, 'bridge_commit', True)
+            self.head.branch = something
+            self.detached = False
+            return True
+
         if commit and source in self.commits:
             self.commits[something] = self.commits[source]
 
@@ -1010,9 +1027,6 @@ nothing to commit, working tree clean
                         return True
                 else:
                     return False
-            elif source != something:
-                # Source was explicitly provided but doesn't exist: fail
-                return False
             self.commits[something] = [Commit.from_json(Commit.Encoder().default(self.head))]
             # Copy one more to create a bridge commit
             self.commits[something].append(Commit.from_json(Commit.Encoder().default(self.head)))

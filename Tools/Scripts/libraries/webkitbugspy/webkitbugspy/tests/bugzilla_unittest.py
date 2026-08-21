@@ -1135,6 +1135,14 @@ What component in 'WebKit' should the bug be associated with?:
             self.assertEqual(issue.related['depends_on'], [tracker.issue(2)])
             self.assertEqual(issue.related['blocks'], [])
 
+            # Bugzilla keys 'related' by the same name 'relate' takes, and the edge runs both ways
+            self.assertEqual(tracker.relation_key('depends_on'), 'depends_on')
+            self.assertEqual(tracker.issue(2).related['blocks'], [issue])
+
+            issue.unrelate(depends_on=tracker.issue(2))
+            self.assertEqual(issue.related['depends_on'], [])
+            self.assertEqual(tracker.issue(2).related['blocks'], [])
+
     def test_relate(self):
         with mocks.Bugzilla(self.URL.split('://')[1], environment=wkmocks.Environment(
                 BUGS_EXAMPLE_COM_USERNAME='tcontributor@example.com',

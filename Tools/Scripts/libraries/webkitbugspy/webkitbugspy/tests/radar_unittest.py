@@ -596,6 +596,19 @@ What version of 'WebKit Text' should the bug be associated with?:
             self.assertEqual(tracker.issue(1).related['blocking'], [tracker.issue(2)])
             self.assertEqual(tracker.issue(2).related['blocked-by'], [tracker.issue(1)])
 
+            # 'relate' takes a keyword, 'related' is keyed by radar's own hyphenated type
+            self.assertEqual(tracker.relation_key('blocked_by'), 'blocked-by')
+
+            self.assertEqual(
+                tracker.issue(2).related[tracker.relation_key('blocked_by')],
+                [tracker.issue(1)],
+            )
+
+            # Removing it removes both ends, as adding it added both
+            tracker.issue(2).unrelate(blocked_by=tracker.issue(1))
+            self.assertEqual(tracker.issue(2).related['blocked-by'], [])
+            self.assertEqual(tracker.issue(1).related['blocking'], [])
+
             tracker.issue(2).relate(parent_of=tracker.issue(3))
             self.assertEqual(tracker.issue(2).related['parent-of'], [tracker.issue(3)])
             self.assertEqual(tracker.issue(3).related['subtask-of'], [tracker.issue(2)])

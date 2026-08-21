@@ -183,6 +183,12 @@ class Tracker(object):
     def relate(self, issue, **relations):
         raise NotImplementedError()
 
+    def unrelate(self, issue, **relations):
+        raise NotImplementedError()
+
+    def relation_key(self, relation):
+        return relation  # Overriden by radar
+
     def add_comment(self, issue, text):
         raise NotImplementedError()
 

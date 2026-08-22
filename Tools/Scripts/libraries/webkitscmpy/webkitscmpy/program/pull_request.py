@@ -492,10 +492,8 @@ class PullRequest(Command):
             return stack_parent, 0
 
         if stack_parent and stack_parent != new_parent:
-            log.warning(
-                f"'{repository.branch}' was stacked on '{stack_parent}', stacking it on '{new_parent}' instead\n"
-                f"Any issue dependency recorded for '{stack_parent}' must be removed by hand"
-            )
+            print(f"'{repository.branch}' was stacked on '{stack_parent}', stacking it on '{new_parent}' instead")
+            Stack.unrelate_issues(repository, repository.branch, stack_parent)
         if Stack.stack_on(repository, repository.branch, new_parent):
             return None, 1
         return new_parent, 0
@@ -882,6 +880,9 @@ class PullRequest(Command):
             cls.add_comment_to_issue(not_radar, pr, commit_class=commit_class)
         elif issue and update_issue:
             cls.add_comment_to_issue(issue, pr, commit_class=commit_class)
+
+        if stack_parent and update_issue:
+            Stack.relate_issues(repository, repository.branch, stack_parent, issues=issues)
 
         if radar_issue and update_issue and radar_issue.tracker.radarclient():
             if args.update_radar and radar_issue.state == 'Analyze' and radar_issue.substate in ['Investigate', 'Fix']:

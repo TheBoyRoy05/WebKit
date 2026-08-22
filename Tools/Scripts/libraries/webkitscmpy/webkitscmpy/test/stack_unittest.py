@@ -25,11 +25,14 @@ import os
 from argparse import Namespace
 from unittest.mock import patch
 
+from webkitbugspy import bugzilla, radar
+from webkitbugspy import mocks as bmocks
 from webkitcorepy import OutputCapture, testing
-from webkitcorepy.mocks import Time as MockTime
+from webkitcorepy.mocks import Environment, Time as MockTime
 
 from webkitscmpy import Commit, local, mocks, program
 
+BUGZILLA = 'https://bugs.example.com'
 CONTRIBUTOR = {'name': 'Tim Contributor', 'emails': ['tcontributor@example.com']}
 
 
@@ -1019,10 +1022,16 @@ class TestStack(testing.PathTestCase):
         self.assertIn("to finish stacking 'eng/sibling' on 'eng/parent'", captured.stderr.getvalue())
         self.assertNotIn('rest of the stack', captured.stderr.getvalue())
 
-    def test_re_parenting_warns_about_the_issue_dependency(self):
-        with OutputCapture(level=logging.WARNING) as captured, mocks.local.Git(self.path) as repo, \
-                mocks.local.Svn(), patch('webkitbugspy.Tracker._trackers', []), MockTime:
-            self.add_stack(repo)
+    def test_re_parenting_forgets_the_old_dependency(self):
+        with OutputCapture() as captured, mocks.local.Git(self.path) as repo, mocks.local.Svn(), bmocks.Bugzilla(
+            BUGZILLA.split('://')[-1],
+            issues=bmocks.ISSUES,
+            environment=Environment(
+                BUGS_EXAMPLE_COM_USERNAME='tcontributor@example.com',
+                BUGS_EXAMPLE_COM_PASSWORD='password',
+            ),
+        ), patch('webkitbugspy.Tracker._trackers', [bugzilla.Tracker(BUGZILLA)]), MockTime:
+            self.add_stack_with_bugs(repo)
             repo.commits['eng/sibling'] = [
                 repo.commits[repo.default_branch][-1],
                 Commit(
@@ -1031,19 +1040,50 @@ class TestStack(testing.PathTestCase):
                     author=CONTRIBUTOR,
                     identifier='5.1@eng/sibling',
                     timestamp=1601669500,
-                    message='[Testing] Sibling change\n',
+                    message=f'[Testing] Sibling change\n{BUGZILLA}/show_bug.cgi?id=3\n',
                 ),
             ]
             self.assertEqual(0, program.main(args=('stack', '--on', 'eng/parent'), path=self.path))
 
-            # Re-parenting cannot clean up an issue dependency, so it has to say so
-            args = Namespace(**{'_new_parent': 'eng/sibling'})
-            parent, result = program.PullRequest.ensure_stack_parent(args, local.Git(self.path))
-            self.assertEqual((parent, result), ('eng/sibling', 0))
+            tracker = bugzilla.Tracker(BUGZILLA)
+            tracker.issue(2).relate(depends_on=tracker.issue(1))
+            self.assertEqual([issue.id for issue in tracker.issue(2).related['depends_on']], [1])
 
-        log = captured.root.log.getvalue()
-        self.assertIn("'eng/child' was stacked on 'eng/parent', stacking it on 'eng/sibling' instead", log)
-        self.assertIn("Any issue dependency recorded for 'eng/parent' must be removed by hand", log)
+            args = Namespace(**{'_new_parent': 'eng/sibling'})
+            self.assertEqual(
+                program.PullRequest.ensure_stack_parent(args, local.Git(self.path)),
+                ('eng/sibling', 0),
+            )
+
+            # The dependency on the branch it is no longer stacked on is dropped, from both ends
+            self.assertEqual([issue.id for issue in bugzilla.Tracker(BUGZILLA).issue(2).related['depends_on']], [])
+            self.assertEqual([issue.id for issue in bugzilla.Tracker(BUGZILLA).issue(1).related['blocks']], [])
+
+        self.assertIn(
+            "'eng/child' was stacked on 'eng/parent', stacking it on 'eng/sibling' instead",
+            captured.stdout.getvalue(),
+        )
+        self.assertIn('no longer depends on', captured.stdout.getvalue())
+
+    def test_unstack_forgets_the_dependency(self):
+        with OutputCapture() as captured, mocks.local.Git(self.path) as repo, mocks.local.Svn(), bmocks.Bugzilla(
+            BUGZILLA.split('://')[-1],
+            issues=bmocks.ISSUES,
+            environment=Environment(
+                BUGS_EXAMPLE_COM_USERNAME='tcontributor@example.com',
+                BUGS_EXAMPLE_COM_PASSWORD='password',
+            ),
+        ), patch('webkitbugspy.Tracker._trackers', [bugzilla.Tracker(BUGZILLA)]), MockTime:
+            self.add_stack_with_bugs(repo)
+            self.assertEqual(0, program.main(args=('stack', '--on', 'eng/parent'), path=self.path))
+
+            tracker = bugzilla.Tracker(BUGZILLA)
+            tracker.issue(2).relate(depends_on=tracker.issue(1))
+
+            self.assertEqual(0, program.main(args=('stack', '--unstack'), path=self.path))
+            self.assertEqual([issue.id for issue in bugzilla.Tracker(BUGZILLA).issue(2).related['depends_on']], [])
+
+        self.assertIn('no longer depends on', captured.stdout.getvalue())
 
     def test_pull_request_no_rebase_detects_broken_stack(self):
         with OutputCapture() as captured, mocks.remote.GitHub() as github, mocks.local.Git(
@@ -1077,3 +1117,260 @@ class TestStack(testing.PathTestCase):
         self.assertEqual(lines[0], "'eng/child' no longer sits on top of 'eng/parent'")
         self.assertIn("stack --rebase' or '", lines[1])
         self.assertIn("pull-request --rebase' to replay it", lines[1])
+
+    @classmethod
+    def add_stack_with_bugs(cls, repo):
+        repo.commits['eng/parent'] = [
+            repo.commits[repo.default_branch][-1],
+            Commit(
+                hash='06de5d56554e693db72313f4ca1fb969c30b8ccb',
+                branch='eng/parent',
+                author=CONTRIBUTOR,
+                identifier='5.1@eng/parent',
+                timestamp=1601668000,
+                message=f'[Testing] Parent change\n{BUGZILLA}/show_bug.cgi?id=1\n',
+            ),
+        ]
+        repo.commits['eng/child'] = [
+            repo.commits['eng/parent'][-1],
+            Commit(
+                hash='b8b921baaad2fd10bc9d0cc9e97f8fa1d6e5f4a1',
+                branch='eng/child',
+                author=CONTRIBUTOR,
+                identifier='5.2@eng/child',
+                timestamp=1601669000,
+                message=f'[Testing] Child change\n{BUGZILLA}/show_bug.cgi?id=2\n',
+            ),
+        ]
+        repo.head = repo.commits['eng/child'][-1]
+        return repo
+
+    @classmethod
+    def add_stack_with_radars(cls, repo):
+        repo.commits['eng/parent'] = [
+            repo.commits[repo.default_branch][-1],
+            Commit(
+                hash='06de5d56554e693db72313f4ca1fb969c30b8ccb',
+                branch='eng/parent',
+                author=CONTRIBUTOR,
+                identifier='5.1@eng/parent',
+                timestamp=1601668000,
+                message='[Testing] Parent change\nrdar://1\n',
+            ),
+        ]
+        repo.commits['eng/child'] = [
+            repo.commits['eng/parent'][-1],
+            Commit(
+                hash='b8b921baaad2fd10bc9d0cc9e97f8fa1d6e5f4a1',
+                branch='eng/child',
+                author=CONTRIBUTOR,
+                identifier='5.2@eng/child',
+                timestamp=1601669000,
+                message='[Testing] Child change\nrdar://2\n',
+            ),
+        ]
+        repo.head = repo.commits['eng/child'][-1]
+        return repo
+
+    def test_pull_request_relates_issues(self):
+        with OutputCapture() as captured, mocks.remote.GitHub() as github, mocks.local.Git(
+            self.path, remote=f'https://{github.remote}',
+            remotes={'fork': f'https://{github.hosts[0]}/Contributor/WebKit'},
+        ) as repo, mocks.local.Svn(), bmocks.Bugzilla(
+            BUGZILLA.split('://')[-1],
+            issues=bmocks.ISSUES,
+            environment=Environment(
+                BUGS_EXAMPLE_COM_USERNAME='tcontributor@example.com',
+                BUGS_EXAMPLE_COM_PASSWORD='password',
+            ),
+        ), patch('webkitbugspy.Tracker._trackers', [bugzilla.Tracker(BUGZILLA)]):
+            self.add_stack_with_bugs(repo)
+            self.assertEqual(0, program.main(
+                args=('pull-request', '--no-history', '--on', 'eng/parent'),
+                path=self.path,
+            ))
+
+            child_issue = bugzilla.Tracker(BUGZILLA).issue(2)
+            self.assertEqual(
+                [issue.id for issue in child_issue.related['depends_on']],
+                [1],
+            )
+
+        self.assertIn(
+            f'{BUGZILLA}/show_bug.cgi?id=2 depends on {BUGZILLA}/show_bug.cgi?id=1',
+            captured.stdout.getvalue(),
+        )
+
+    def test_pull_request_no_issue_skips_relating(self):
+        with OutputCapture() as captured, mocks.remote.GitHub() as github, mocks.local.Git(
+            self.path, remote=f'https://{github.remote}',
+            remotes={'fork': f'https://{github.hosts[0]}/Contributor/WebKit'},
+        ) as repo, mocks.local.Svn(), bmocks.Bugzilla(
+            BUGZILLA.split('://')[-1],
+            issues=bmocks.ISSUES,
+            environment=Environment(
+                BUGS_EXAMPLE_COM_USERNAME='tcontributor@example.com',
+                BUGS_EXAMPLE_COM_PASSWORD='password',
+            ),
+        ), patch('webkitbugspy.Tracker._trackers', [bugzilla.Tracker(BUGZILLA)]):
+            self.add_stack_with_bugs(repo)
+            self.assertEqual(0, program.main(
+                args=('pull-request', '--no-history', '--on', 'eng/parent', '--no-issue'),
+                path=self.path,
+            ))
+
+            self.assertEqual(bugzilla.Tracker(BUGZILLA).issue(2).related['depends_on'], [])
+
+        self.assertNotIn('depends on', captured.stdout.getvalue())
+
+    def test_pull_request_relates_issues_once(self):
+        with OutputCapture() as captured, mocks.remote.GitHub() as github, mocks.local.Git(
+            self.path, remote=f'https://{github.remote}',
+            remotes={'fork': f'https://{github.hosts[0]}/Contributor/WebKit'},
+        ) as repo, mocks.local.Svn(), bmocks.Bugzilla(
+            BUGZILLA.split('://')[-1],
+            issues=bmocks.ISSUES,
+            environment=Environment(
+                BUGS_EXAMPLE_COM_USERNAME='tcontributor@example.com',
+                BUGS_EXAMPLE_COM_PASSWORD='password',
+            ),
+        ), patch('webkitbugspy.Tracker._trackers', [bugzilla.Tracker(BUGZILLA)]):
+            self.add_stack_with_bugs(repo)
+            self.assertEqual(0, program.main(
+                args=('pull-request', '--no-history', '--on', 'eng/parent'),
+                path=self.path,
+            ))
+            self.assertEqual(0, program.main(args=('pull-request', '--no-history'), path=self.path))
+
+            self.assertEqual(
+                [issue.id for issue in bugzilla.Tracker(BUGZILLA).issue(2).related['depends_on']],
+                [1],
+            )
+
+        self.assertEqual(
+            captured.stdout.getvalue().count(f'{BUGZILLA}/show_bug.cgi?id=2 depends on'),
+            1,
+        )
+
+    def test_pull_request_relates_radars(self):
+        with OutputCapture() as captured, mocks.remote.GitHub() as github, mocks.local.Git(
+            self.path, remote=f'https://{github.remote}',
+            remotes={'fork': f'https://{github.hosts[0]}/Contributor/WebKit'},
+        ) as repo, mocks.local.Svn(), Environment(RADAR_USERNAME='tcontributor'), bmocks.Radar(
+            issues=bmocks.ISSUES, projects=bmocks.PROJECTS,
+        ), patch('webkitbugspy.Tracker._trackers', [radar.Tracker()]):
+            self.add_stack_with_radars(repo)
+            self.assertEqual(0, program.main(
+                args=('pull-request', '--no-history', '--on', 'eng/parent'),
+                path=self.path,
+            ))
+
+            child_issue = radar.Tracker().issue(2)
+            self.assertEqual(
+                [issue.id for issue in child_issue.related['blocked-by']],
+                [1],
+            )
+
+        self.assertIn('rdar://2 blocked by rdar://1', captured.stdout.getvalue())
+
+    def test_pull_request_relates_radars_once(self):
+        with OutputCapture() as captured, mocks.remote.GitHub() as github, mocks.local.Git(
+            self.path, remote=f'https://{github.remote}',
+            remotes={'fork': f'https://{github.hosts[0]}/Contributor/WebKit'},
+        ) as repo, mocks.local.Svn(), Environment(RADAR_USERNAME='tcontributor'), bmocks.Radar(
+            issues=bmocks.ISSUES, projects=bmocks.PROJECTS,
+        ), patch('webkitbugspy.Tracker._trackers', [radar.Tracker()]):
+            self.add_stack_with_radars(repo)
+            self.assertEqual(0, program.main(args=('pull-request', '--no-history', '--on', 'eng/parent'), path=self.path))
+            self.assertEqual(0, program.main(args=('pull-request', '--no-history'), path=self.path))
+
+            self.assertEqual(
+                [issue.id for issue in radar.Tracker().issue(2).related['blocked-by']],
+                [1],
+            )
+
+        self.assertEqual(captured.stdout.getvalue().count('rdar://2 blocked by rdar://1'), 1)
+
+    def test_issues_for_falls_back_to_branch_config(self):
+        with OutputCapture(), mocks.local.Git(self.path) as repo, mocks.local.Svn(), bmocks.Bugzilla(
+            BUGZILLA.split('://')[-1],
+            issues=bmocks.ISSUES,
+            environment=Environment(
+                BUGS_EXAMPLE_COM_USERNAME='tcontributor@example.com',
+                BUGS_EXAMPLE_COM_PASSWORD='password',
+            ),
+        ), patch('webkitbugspy.Tracker._trackers', [bugzilla.Tracker(BUGZILLA)]), MockTime:
+            self.add_parent(repo)
+            repo.edit_config('branch.eng/parent.bug', f'{BUGZILLA}/show_bug.cgi?id=1')
+
+            issues = program.Stack.issues_for(local.Git(self.path), 'eng/parent')
+            self.assertEqual(
+                [issue.link for issue in issues],
+                [f'{BUGZILLA}/show_bug.cgi?id=1'],
+            )
+
+    @classmethod
+    def add_stack_with_bugs_and_radars(cls, repo):
+        repo.commits['eng/parent'] = [
+            repo.commits[repo.default_branch][-1],
+            Commit(
+                hash='06de5d56554e693db72313f4ca1fb969c30b8ccb',
+                branch='eng/parent',
+                author=CONTRIBUTOR,
+                identifier='5.1@eng/parent',
+                timestamp=1601668000,
+                message=f'[Testing] Parent change\n{BUGZILLA}/show_bug.cgi?id=1\nrdar://1\n',
+            ),
+        ]
+        repo.commits['eng/child'] = [
+            repo.commits['eng/parent'][-1],
+            Commit(
+                hash='b8b921baaad2fd10bc9d0cc9e97f8fa1d6e5f4a1',
+                branch='eng/child',
+                author=CONTRIBUTOR,
+                identifier='5.2@eng/child',
+                timestamp=1601669000,
+                message=f'[Testing] Child change\n{BUGZILLA}/show_bug.cgi?id=2\nrdar://2\n',
+            ),
+        ]
+        repo.head = repo.commits['eng/child'][-1]
+        return repo
+
+    def test_pull_request_relates_each_tracker_to_its_own(self):
+        with OutputCapture() as captured, mocks.remote.GitHub() as github, mocks.local.Git(
+            self.path, remote=f'https://{github.remote}',
+            remotes={'fork': f'https://{github.hosts[0]}/Contributor/WebKit'},
+        ) as repo, mocks.local.Svn(), bmocks.Bugzilla(
+            BUGZILLA.split('://')[-1],
+            issues=bmocks.ISSUES,
+            environment=Environment(
+                BUGS_EXAMPLE_COM_USERNAME='tcontributor@example.com',
+                BUGS_EXAMPLE_COM_PASSWORD='password',
+                RADAR_USERNAME='tcontributor',
+            ),
+        ), bmocks.Radar(
+            issues=bmocks.ISSUES, projects=bmocks.PROJECTS,
+        ), patch('webkitbugspy.Tracker._trackers', [bugzilla.Tracker(BUGZILLA), radar.Tracker()]):
+            self.add_stack_with_bugs_and_radars(repo)
+            self.assertEqual(0, program.main(
+                args=('pull-request', '--no-history', '--on', 'eng/parent'),
+                path=self.path,
+            ))
+
+            # A bug depends on the parent's bug, a radar is blocked by the parent's radar,
+            # rather than either being related to whichever issue came first
+            self.assertEqual(
+                [issue.id for issue in bugzilla.Tracker(BUGZILLA).issue(2).related['depends_on']],
+                [1],
+            )
+            self.assertEqual(
+                [issue.id for issue in bugzilla.Tracker(BUGZILLA).issue(1).related['blocks']],
+                [2],
+            )
+            self.assertEqual(
+                [issue.id for issue in radar.Tracker().issue(2).related['blocked-by']],
+                [1],
+            )
+
+        self.assertIn('depends on', captured.stdout.getvalue())
+        self.assertIn('rdar://2 blocked by rdar://1', captured.stdout.getvalue())

@@ -27,6 +27,7 @@ import sys
 from collections import namedtuple
 from .command import Command
 
+from webkitbugspy import Tracker, radar
 from webkitcorepy import run, Version
 from webkitscmpy import local, log
 
@@ -381,6 +382,64 @@ class Stack(Command):
         return candidate
 
     @classmethod
+    def issues_for(cls, git, branch, config=None):
+        commit = git.commit(branch=branch, include_log=True, include_identifier=False)
+        if commit and commit.issues:
+            return commit.issues
+        config = git.config() if config is None else config
+        issue = Tracker.from_string(config.get(f'branch.{branch}.bug') or '')
+        return [issue] if issue else []
+
+    @classmethod
+    def _matching_issues(cls, git, branch, parent, issues=None):
+        """Each of a branch's issues paired with the parent issue tracked by the same tracker."""
+        parent_issues = cls.issues_for(git, parent)
+        if not parent_issues:
+            log.info(f"'{parent}' has no associated issue, nothing to relate to '{branch}'")
+            return []
+        if issues is None:
+            issues = cls.issues_for(git, branch)
+
+        result = []
+        for issue in issues:
+            is_radar = isinstance(issue.tracker, radar.Tracker)
+            match = next((
+                candidate for candidate in parent_issues
+                if isinstance(candidate.tracker, radar.Tracker) == is_radar
+            ), None)
+            if match and match.link != issue.link:
+                result.append((issue, match, 'blocked_by' if is_radar else 'depends_on'))
+        return result
+
+    @classmethod
+    def _apply_relations(cls, git, branch, parent, issues=None, related=True):
+        """Bring each issue's dependency on the parent's issue to 'related', leaving the rest alone."""
+        for issue, match, relation in cls._matching_issues(git, branch, parent, issues=issues):
+            label = f"{'' if related else 'no longer '}{relation.replace('_', ' ')}"
+            try:
+                existing = (issue.related or {}).get(issue.tracker.relation_key(relation)) or []
+                if any(candidate.link == match.link for candidate in existing) == related:
+                    log.info(f'{issue.link} already {label} {match.link}')
+                    continue
+
+                change = issue.relate if related else issue.unrelate
+                if change(**{relation: match}):
+                    print(f'{issue.link} {label} {match.link}')
+                else:
+                    sys.stderr.write(f'Failed to record that {issue.link} {label} {match.link}\n')
+            except (NotImplementedError, TypeError) as error:
+                log.warning(f'Cannot record that {issue.link} {label} {match.link}: {error}')
+        return 0
+
+    @classmethod
+    def relate_issues(cls, git, branch, parent, issues=None):
+        return cls._apply_relations(git, branch, parent, issues=issues, related=True)
+
+    @classmethod
+    def unrelate_issues(cls, git, branch, parent, issues=None):
+        return cls._apply_relations(git, branch, parent, issues=issues, related=False)
+
+    @classmethod
     def stack_on(cls, git, branch, parent):
         """Record that 'branch' is stacked on 'parent,' and put it there."""
         return cls._set_parent(git, branch, parent) or cls._restack(git, branch, parent)
@@ -436,7 +495,9 @@ class Stack(Command):
             return cls.rebase(git, remote=args.remote) if args.rebase else 0
 
         if args.unstack:
-            was_stacked = bool(cls.parent(git, branch))
+            if parent := cls.parent(git, branch):
+                cls.unrelate_issues(git, branch, parent)
+            was_stacked = bool(parent)
             if cls._unset_parent(git, branch):
                 return 1
             print(f"'{branch}' is no longer stacked on another branch")

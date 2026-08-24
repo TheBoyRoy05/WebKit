@@ -23,6 +23,7 @@
 import logging
 import os
 from argparse import Namespace
+from typing import Callable
 from unittest.mock import patch
 
 from webkitbugspy import bugzilla, radar
@@ -31,6 +32,7 @@ from webkitcorepy import OutputCapture, testing
 from webkitcorepy.mocks import Environment, Time as MockTime
 
 from webkitscmpy import Commit, local, mocks, program
+from webkitscmpy.program.stack import Rebase
 
 BUGZILLA = 'https://bugs.example.com'
 CONTRIBUTOR = {'name': 'Tim Contributor', 'emails': ['tcontributor@example.com']}
@@ -39,13 +41,13 @@ CONTRIBUTOR = {'name': 'Tim Contributor', 'emails': ['tcontributor@example.com']
 class TestStack(testing.PathTestCase):
     basepath = 'mock/repository'
 
-    def setUp(self):
+    def setUp(self) -> None:
         super().setUp()
         os.mkdir(os.path.join(self.path, '.git'))
         os.mkdir(os.path.join(self.path, '.svn'))
 
     @classmethod
-    def add_parent(cls, repo):
+    def add_parent(cls, repo: mocks.local.Git) -> mocks.local.Git:
         repo.commits['eng/parent'] = [
             repo.commits[repo.default_branch][-1],
             Commit(
@@ -60,7 +62,7 @@ class TestStack(testing.PathTestCase):
         return repo
 
     @classmethod
-    def add_stack(cls, repo):
+    def add_stack(cls, repo: mocks.local.Git) -> mocks.local.Git:
         cls.add_parent(repo)
         repo.commits['eng/child'] = [
             repo.commits['eng/parent'][-1],
@@ -77,13 +79,13 @@ class TestStack(testing.PathTestCase):
         return repo
 
     @classmethod
-    def record_into(cls, recorded):
-        def capture(git, step):
+    def record_into(cls, recorded: list[Rebase]) -> Callable[[local.Git, Rebase], int]:
+        def capture(git: local.Git, step: Rebase) -> int:
             recorded.append(step)
             return 0
         return capture
 
-    def test_set_parent(self):
+    def test_set_parent(self) -> None:
         with OutputCapture() as captured, mocks.local.Git(self.path) as repo, mocks.local.Svn(), \
                 patch('webkitbugspy.Tracker._trackers', []), MockTime:
             self.add_stack(repo)
@@ -104,7 +106,7 @@ class TestStack(testing.PathTestCase):
             "'eng/child' is stacked on 'eng/parent'\n" * 2,
         )
 
-    def test_set_parent_missing(self):
+    def test_set_parent_missing(self) -> None:
         with OutputCapture() as captured, mocks.local.Git(self.path) as repo, mocks.local.Svn(), \
                 patch('webkitbugspy.Tracker._trackers', []), MockTime:
             self.add_stack(repo)
@@ -115,7 +117,7 @@ class TestStack(testing.PathTestCase):
             "Could not find 'eng/missing' as a branch, pull-request, or issue in this checkout\n",
         )
 
-    def test_set_parent_production(self):
+    def test_set_parent_production(self) -> None:
         with OutputCapture() as captured, mocks.local.Git(self.path) as repo, mocks.local.Svn(), \
                 patch('webkitbugspy.Tracker._trackers', []), MockTime:
             self.add_stack(repo)
@@ -127,7 +129,7 @@ class TestStack(testing.PathTestCase):
             "'main' is not a development branch, a branch cannot be stacked on it\n",
         )
 
-    def test_set_parent_self(self):
+    def test_set_parent_self(self) -> None:
         with OutputCapture() as captured, mocks.local.Git(self.path) as repo, mocks.local.Svn(), \
                 patch('webkitbugspy.Tracker._trackers', []), MockTime:
             self.add_stack(repo)
@@ -135,7 +137,7 @@ class TestStack(testing.PathTestCase):
 
         self.assertEqual(captured.stderr.getvalue(), "'eng/child' cannot be stacked on itself\n")
 
-    def test_set_parent_self_with_child(self):
+    def test_set_parent_self_with_child(self) -> None:
         with OutputCapture() as captured, mocks.local.Git(self.path) as repo, mocks.local.Svn(), \
                 patch('webkitbugspy.Tracker._trackers', []), MockTime:
             self.add_stack(repo)
@@ -151,7 +153,7 @@ class TestStack(testing.PathTestCase):
             "'eng/parent' cannot be stacked on itself\n",
         )
 
-    def test_set_parent_cycle(self):
+    def test_set_parent_cycle(self) -> None:
         with OutputCapture() as captured, mocks.local.Git(self.path) as repo, mocks.local.Svn(), \
                 patch('webkitbugspy.Tracker._trackers', []), MockTime:
             self.add_stack(repo)
@@ -164,7 +166,7 @@ class TestStack(testing.PathTestCase):
             "'eng/child' is stacked on 'eng/parent,' stacking 'eng/parent' on it would create a cycle\n",
         )
 
-    def test_set_parent_refuses_a_cycle_above(self):
+    def test_set_parent_refuses_a_cycle_above(self) -> None:
         with OutputCapture() as captured, mocks.local.Git(self.path) as repo, mocks.local.Svn(), \
                 patch('webkitbugspy.Tracker._trackers', []), MockTime:
             self.add_parent(repo)
@@ -201,7 +203,7 @@ class TestStack(testing.PathTestCase):
 
         self.assertIn('is part of a cycle of stacked branches\n', captured.stderr.getvalue())
 
-    def test_set_parent_on_pull_request(self):
+    def test_set_parent_on_pull_request(self) -> None:
         with OutputCapture() as captured, mocks.remote.GitHub() as github, mocks.local.Git(
             self.path, remote=f'https://{github.remote}',
             remotes={'fork': f'https://{github.hosts[0]}/Contributor/WebKit'},
@@ -219,7 +221,7 @@ class TestStack(testing.PathTestCase):
 
         self.assertIn("'eng/child' is stacked on 'eng/parent'", captured.stdout.getvalue())
 
-    def test_set_parent_rebases_by_default(self):
+    def test_set_parent_rebases_by_default(self) -> None:
         with OutputCapture(level=logging.INFO) as captured, mocks.local.Git(self.path) as repo, mocks.local.Svn(), \
                 patch('webkitbugspy.Tracker._trackers', []), MockTime:
             self.add_stack(repo)
@@ -241,7 +243,7 @@ class TestStack(testing.PathTestCase):
         self.assertEqual(captured.stderr.getvalue(), '')
         self.assertIn("Rebasing 'eng/child' on 'remotes/origin/main'...", captured.root.log.getvalue())
 
-    def test_set_parent_no_rebase(self):
+    def test_set_parent_no_rebase(self) -> None:
         with OutputCapture(level=logging.INFO) as captured, mocks.local.Git(self.path) as repo, mocks.local.Svn(), \
                 patch('webkitbugspy.Tracker._trackers', []), MockTime:
             self.add_stack(repo)
@@ -270,7 +272,7 @@ class TestStack(testing.PathTestCase):
         self.assertEqual(captured.stderr.getvalue(), '')
         self.assertNotIn('Rebasing', captured.root.log.getvalue())
 
-    def test_unstack_no_rebase(self):
+    def test_unstack_no_rebase(self) -> None:
         with OutputCapture(level=logging.INFO) as captured, mocks.local.Git(self.path) as repo, mocks.local.Svn(), \
                 patch('webkitbugspy.Tracker._trackers', []), MockTime:
             self.add_stack(repo)
@@ -284,8 +286,8 @@ class TestStack(testing.PathTestCase):
         self.assertEqual(captured.stderr.getvalue(), '')
         self.assertNotIn('Rebasing', captured.root.log.getvalue())
 
-    def test_set_parent_failure_records_nothing(self):
-        def fail(git, step):
+    def test_set_parent_failure_records_nothing(self) -> None:
+        def fail(git: local.Git, step: Rebase) -> int:
             return 1
 
         with OutputCapture() as captured, mocks.local.Git(self.path) as repo, mocks.local.Svn(), \
@@ -317,8 +319,8 @@ class TestStack(testing.PathTestCase):
             captured.stderr.getvalue(),
         )
 
-    def test_set_parent_failure_keeps_the_previous_parent(self):
-        def fail(git, step):
+    def test_set_parent_failure_keeps_the_previous_parent(self) -> None:
+        def fail(git: local.Git, step: Rebase) -> int:
             return 1
 
         with OutputCapture(), mocks.local.Git(self.path) as repo, mocks.local.Svn(), \
@@ -346,7 +348,7 @@ class TestStack(testing.PathTestCase):
             self.assertEqual(config.get('branch.eng/child.stack-parent'), 'eng/parent')
             self.assertEqual(config.get('branch.eng/child.stack-base'), base)
 
-    def test_set_parent_on_ambiguous_issue(self):
+    def test_set_parent_on_ambiguous_issue(self) -> None:
         with OutputCapture(level=logging.WARNING) as captured, mocks.local.Git(self.path) as repo, \
                 mocks.local.Svn(), patch('webkitbugspy.Tracker._trackers', []), MockTime:
             self.add_stack(repo)
@@ -367,7 +369,7 @@ class TestStack(testing.PathTestCase):
             captured.root.log.getvalue(),
         )
 
-    def test_set_parent_on_unstackable_pull_request(self):
+    def test_set_parent_on_unstackable_pull_request(self) -> None:
         with OutputCapture() as captured, mocks.remote.GitHub() as github, mocks.local.Git(
             self.path, remote=f'https://{github.remote}',
             remotes={'fork': f'https://{github.hosts[0]}/Contributor/WebKit'},
@@ -393,7 +395,7 @@ class TestStack(testing.PathTestCase):
         self.assertIn('has already been merged, there is nothing to stack on', captured.stderr.getvalue())
         self.assertIn("is from 'eng/never-checked-out,' which does not exist", captured.stderr.getvalue())
 
-    def test_set_parent_branching(self):
+    def test_set_parent_branching(self) -> None:
         with OutputCapture() as captured, mocks.local.Git(self.path) as repo, mocks.local.Svn(), \
                 patch('webkitbugspy.Tracker._trackers', []), MockTime:
             self.add_stack(repo)
@@ -426,7 +428,7 @@ class TestStack(testing.PathTestCase):
             '    - eng/sibling (this pull request)\n',
         )
 
-    def test_unstack(self):
+    def test_unstack(self) -> None:
         with OutputCapture() as captured, mocks.local.Git(self.path) as repo, mocks.local.Svn(), \
                 patch('webkitbugspy.Tracker._trackers', []), MockTime:
             self.add_stack(repo)
@@ -447,7 +449,7 @@ class TestStack(testing.PathTestCase):
             "'eng/child' is no longer stacked on another branch\n",
         )
 
-    def test_unstack_unstacked_branch_is_left_alone(self):
+    def test_unstack_unstacked_branch_is_left_alone(self) -> None:
         with OutputCapture() as captured, mocks.local.Git(self.path) as repo, mocks.local.Svn(), \
                 patch('webkitbugspy.Tracker._trackers', []), MockTime:
             self.add_stack(repo)
@@ -459,7 +461,7 @@ class TestStack(testing.PathTestCase):
 
         self.assertEqual(captured.stderr.getvalue(), '')
 
-    def test_parent_deleted(self):
+    def test_parent_deleted(self) -> None:
         with OutputCapture() as captured, mocks.local.Git(self.path) as repo, mocks.local.Svn(), \
                 patch('webkitbugspy.Tracker._trackers', []), MockTime:
             self.add_stack(repo)
@@ -473,7 +475,7 @@ class TestStack(testing.PathTestCase):
             "'eng/child' is not part of a stack\n",
         )
 
-    def test_parent_deleted_refuses_to_rebase(self):
+    def test_parent_deleted_refuses_to_rebase(self) -> None:
         with OutputCapture() as captured, mocks.local.Git(self.path) as repo, mocks.local.Svn(), \
                 patch('webkitbugspy.Tracker._trackers', []), MockTime:
             self.add_stack(repo)
@@ -493,7 +495,7 @@ class TestStack(testing.PathTestCase):
         )
         self.assertIn("stack --unstack' to forget it", captured.stderr.getvalue())
 
-    def test_parent_deleted_refuses_to_upload(self):
+    def test_parent_deleted_refuses_to_upload(self) -> None:
         with OutputCapture() as captured, mocks.remote.GitHub() as github, mocks.local.Git(
             self.path, remote=f'https://{github.remote}',
             remotes={'fork': f'https://{github.hosts[0]}/Contributor/WebKit'},
@@ -511,7 +513,7 @@ class TestStack(testing.PathTestCase):
             captured.stderr.getvalue(),
         )
 
-    def test_landed_parent_is_forgotten_before_rebase(self):
+    def test_landed_parent_is_forgotten_before_rebase(self) -> None:
         with OutputCapture() as captured, mocks.remote.GitHub() as github, mocks.local.Git(
             self.path, remote=f'https://{github.remote}',
             remotes={'fork': f'https://{github.hosts[0]}/Contributor/WebKit'},
@@ -539,7 +541,7 @@ class TestStack(testing.PathTestCase):
             captured.stdout.getvalue(),
         )
 
-    def test_landed_parent_is_forgotten_before_upload(self):
+    def test_landed_parent_is_forgotten_before_upload(self) -> None:
         with OutputCapture() as captured, mocks.remote.GitHub() as github, mocks.local.Git(
             self.path, remote=f'https://{github.remote}',
             remotes={'fork': f'https://{github.hosts[0]}/Contributor/WebKit'},
@@ -564,7 +566,7 @@ class TestStack(testing.PathTestCase):
             captured.stdout.getvalue(),
         )
 
-    def test_landed_parent_which_still_exists_is_left_alone(self):
+    def test_landed_parent_which_still_exists_is_left_alone(self) -> None:
         with OutputCapture(), mocks.remote.GitHub() as github, mocks.local.Git(
             self.path, remote=f'https://{github.remote}',
             remotes={'fork': f'https://{github.hosts[0]}/Contributor/WebKit'},
@@ -584,7 +586,7 @@ class TestStack(testing.PathTestCase):
                 'eng/parent',
             )
 
-    def test_parent_with_an_open_pull_request_still_refuses(self):
+    def test_parent_with_an_open_pull_request_still_refuses(self) -> None:
         with OutputCapture() as captured, mocks.remote.GitHub() as github, mocks.local.Git(
             self.path, remote=f'https://{github.remote}',
             remotes={'fork': f'https://{github.hosts[0]}/Contributor/WebKit'},
@@ -611,7 +613,7 @@ class TestStack(testing.PathTestCase):
             captured.stderr.getvalue(),
         )
 
-    def test_listing(self):
+    def test_listing(self) -> None:
         with OutputCapture() as captured, mocks.local.Git(self.path) as repo, mocks.local.Svn(), \
                 patch('webkitbugspy.Tracker._trackers', []), MockTime:
             self.add_stack(repo)
@@ -634,7 +636,7 @@ class TestStack(testing.PathTestCase):
             '    - eng/child\n',
         )
 
-    def test_listing_does_not_rebase(self):
+    def test_listing_does_not_rebase(self) -> None:
         with OutputCapture(level=logging.INFO) as captured, mocks.local.Git(self.path) as repo, mocks.local.Svn(), \
                 patch('webkitbugspy.Tracker._trackers', []), MockTime:
             self.add_stack(repo)
@@ -658,7 +660,7 @@ class TestStack(testing.PathTestCase):
 
         self.assertNotIn('Rebasing', captured.root.log.getvalue())
 
-    def test_listing_not_stacked(self):
+    def test_listing_not_stacked(self) -> None:
         with OutputCapture() as captured, mocks.local.Git(self.path) as repo, mocks.local.Svn(), \
                 patch('webkitbugspy.Tracker._trackers', []), MockTime:
             self.add_parent(repo)
@@ -668,7 +670,7 @@ class TestStack(testing.PathTestCase):
         self.assertEqual(captured.stderr.getvalue(), '')
         self.assertEqual(captured.stdout.getvalue(), "'eng/parent' is not part of a stack\n")
 
-    def test_listing_nests_a_deeper_sibling(self):
+    def test_listing_nests_a_deeper_sibling(self) -> None:
         with OutputCapture() as captured, mocks.local.Git(self.path) as repo, mocks.local.Svn(), \
                 patch('webkitbugspy.Tracker._trackers', []), MockTime:
             self.add_stack(repo)
@@ -713,7 +715,7 @@ class TestStack(testing.PathTestCase):
             '    - eng/sibling\n',
         )
 
-    def test_listing_refuses_a_cycle_above(self):
+    def test_listing_refuses_a_cycle_above(self) -> None:
         with OutputCapture() as captured, mocks.local.Git(self.path) as repo, mocks.local.Svn(), \
                 patch('webkitbugspy.Tracker._trackers', []), MockTime:
             self.add_stack(repo)
@@ -725,7 +727,7 @@ class TestStack(testing.PathTestCase):
 
         self.assertIn('is part of a cycle of stacked branches\n', captured.stderr.getvalue())
 
-    def test_rebase(self):
+    def test_rebase(self) -> None:
         with OutputCapture(level=logging.INFO) as captured, mocks.local.Git(self.path) as repo, mocks.local.Svn(), \
                 patch('webkitbugspy.Tracker._trackers', []), MockTime:
             self.add_stack(repo)
@@ -756,7 +758,7 @@ class TestStack(testing.PathTestCase):
             ["Rebasing 'eng/child' on 'remotes/origin/main'..."],
         )
 
-    def test_rebase_falls_back_when_git_cannot_update_refs(self):
+    def test_rebase_falls_back_when_git_cannot_update_refs(self) -> None:
         recorded = []
 
         with OutputCapture(level=logging.INFO), mocks.local.Git(self.path, git_version='2.37.0') as repo, \
@@ -773,7 +775,7 @@ class TestStack(testing.PathTestCase):
             [('eng/parent', False), ('eng/child', False)],
         )
 
-    def test_rebase_records_missing_base(self):
+    def test_rebase_records_missing_base(self) -> None:
         with OutputCapture(level=logging.INFO), mocks.local.Git(self.path) as repo, mocks.local.Svn(), \
                 patch('webkitbugspy.Tracker._trackers', []), MockTime:
             self.add_stack(repo)
@@ -790,7 +792,7 @@ class TestStack(testing.PathTestCase):
                 repo.commits['eng/parent'][-1].hash,
             )
 
-    def test_rebase_uses_recorded_base(self):
+    def test_rebase_uses_recorded_base(self) -> None:
         recorded = []
 
         with OutputCapture(level=logging.INFO), mocks.local.Git(self.path) as repo, mocks.local.Svn(), \
@@ -816,7 +818,7 @@ class TestStack(testing.PathTestCase):
             # into the parent's rebase, which is what lets an amended parent be recovered from
             self.assertEqual(recorded[-1], ('eng/child', 'eng/parent', base, False))
 
-    def test_rebase_branches_from_the_fork_point(self):
+    def test_rebase_branches_from_the_fork_point(self) -> None:
         recorded = []
 
         with OutputCapture(level=logging.INFO), mocks.local.Git(self.path) as repo, mocks.local.Svn(), \
@@ -869,7 +871,7 @@ class TestStack(testing.PathTestCase):
             # The cascade ends on top of the last run, so it has to come back
             self.assertEqual(repo.head.branch, 'eng/child')
 
-    def test_rebase_refuses_detached_head(self):
+    def test_rebase_refuses_detached_head(self) -> None:
         with OutputCapture() as captured, mocks.local.Git(self.path, detached=True) as repo, mocks.local.Svn(), \
                 patch('webkitbugspy.Tracker._trackers', []), MockTime:
             self.add_stack(repo)
@@ -880,7 +882,7 @@ class TestStack(testing.PathTestCase):
             'HEAD is not on a branch, so there is no stack to rebase\n',
         )
 
-    def test_pull_cascades_stack(self):
+    def test_pull_cascades_stack(self) -> None:
         with OutputCapture(level=logging.INFO) as captured, mocks.local.Git(self.path) as repo, mocks.local.Svn(), \
                 patch('webkitbugspy.Tracker._trackers', []), MockTime:
             self.add_stack(repo)
@@ -893,7 +895,7 @@ class TestStack(testing.PathTestCase):
             ["Rebasing 'eng/child' on 'remotes/origin/main'..."],
         )
 
-    def test_pull_unstacked_branch_unchanged(self):
+    def test_pull_unstacked_branch_unchanged(self) -> None:
         with OutputCapture(level=logging.INFO) as captured, mocks.local.Git(self.path) as repo, mocks.local.Svn(), \
                 patch('webkitbugspy.Tracker._trackers', []), MockTime:
             self.add_parent(repo)
@@ -903,7 +905,7 @@ class TestStack(testing.PathTestCase):
         self.assertEqual(captured.stderr.getvalue(), '')
         self.assertNotIn('Rebasing', captured.root.log.getvalue())
 
-    def test_restack_records_base_when_already_stacked(self):
+    def test_restack_records_base_when_already_stacked(self) -> None:
         recorded = []
 
         with OutputCapture(), mocks.local.Git(self.path) as repo, mocks.local.Svn(), \
@@ -922,7 +924,7 @@ class TestStack(testing.PathTestCase):
                 repo.commits['eng/parent'][-1].hash,
             )
 
-    def test_restack_uses_recorded_base(self):
+    def test_restack_uses_recorded_base(self) -> None:
         recorded = []
 
         with OutputCapture(), mocks.local.Git(self.path) as repo, mocks.local.Svn(), \
@@ -957,7 +959,7 @@ class TestStack(testing.PathTestCase):
             ('eng/sibling', 'eng/parent', 'deadbeefdeadbeefdeadbeefdeadbeefdeadbeef', False),
         ])
 
-    def test_branch_on(self):
+    def test_branch_on(self) -> None:
         with OutputCapture(level=logging.INFO) as captured, mocks.local.Git(self.path) as repo, mocks.local.Svn(), \
                 patch('webkitbugspy.Tracker._trackers', []), MockTime:
             self.add_parent(repo)
@@ -978,7 +980,7 @@ class TestStack(testing.PathTestCase):
             "Created the local development branch 'eng/child' stacked on 'eng/parent'\n",
         )
 
-    def test_branch_on_shorthand(self):
+    def test_branch_on_shorthand(self) -> None:
         with OutputCapture(level=logging.INFO) as captured, mocks.local.Git(self.path) as repo, mocks.local.Svn(), \
                 patch('webkitbugspy.Tracker._trackers', []), MockTime:
             self.add_parent(repo)
@@ -993,7 +995,7 @@ class TestStack(testing.PathTestCase):
 
         self.assertEqual(captured.stderr.getvalue(), '')
 
-    def test_branch_on_missing(self):
+    def test_branch_on_missing(self) -> None:
         with OutputCapture() as captured, mocks.local.Git(self.path), mocks.local.Svn(), \
                 patch('webkitbugspy.Tracker._trackers', []), MockTime:
             self.assertEqual(1, program.main(
@@ -1007,7 +1009,7 @@ class TestStack(testing.PathTestCase):
         )
         self.assertEqual(captured.stdout.getvalue(), '')
 
-    def test_branch_on_production(self):
+    def test_branch_on_production(self) -> None:
         with OutputCapture() as captured, mocks.local.Git(self.path), mocks.local.Svn(), \
                 patch('webkitbugspy.Tracker._trackers', []), MockTime:
             self.assertEqual(1, program.main(
@@ -1020,7 +1022,7 @@ class TestStack(testing.PathTestCase):
             "'main' is not a development branch, a branch cannot be stacked on it\n",
         )
 
-    def test_branch_on_existing(self):
+    def test_branch_on_existing(self) -> None:
         with OutputCapture() as captured, mocks.local.Git(self.path) as repo, mocks.local.Svn(), \
                 patch('webkitbugspy.Tracker._trackers', []), MockTime:
             self.add_stack(repo)
@@ -1043,7 +1045,7 @@ class TestStack(testing.PathTestCase):
             "Stacked the local development branch 'eng/child' on 'eng/parent'\n",
         )
 
-    def test_branch_on_pull_request(self):
+    def test_branch_on_pull_request(self) -> None:
         with OutputCapture() as captured, mocks.remote.GitHub() as github, mocks.local.Git(
             self.path, remote=f'https://{github.remote}',
             remotes={'fork': f'https://{github.hosts[0]}/Contributor/WebKit'},
@@ -1071,7 +1073,7 @@ class TestStack(testing.PathTestCase):
             captured.stdout.getvalue(),
         )
 
-    def test_pull_request(self):
+    def test_pull_request(self) -> None:
         with OutputCapture(level=logging.INFO) as captured, mocks.remote.GitHub() as github, mocks.local.Git(
             self.path, remote=f'https://{github.remote}',
             remotes={'fork': f'https://{github.hosts[0]}/Contributor/WebKit'},
@@ -1094,7 +1096,7 @@ class TestStack(testing.PathTestCase):
                 '    - eng/child (this pull request)',
             )
 
-    def test_pull_request_number_parsing(self):
+    def test_pull_request_number_parsing(self) -> None:
         self.assertEqual(program.Stack.pull_request_number('71333'), 71333)
         self.assertEqual(program.Stack.pull_request_number('https://github.com/WebKit/WebKit/pull/71333'), 71333)
         self.assertEqual(program.Stack.pull_request_number('https://github.com/WebKit/WebKit/pull/71333/files'), 71333)
@@ -1102,7 +1104,7 @@ class TestStack(testing.PathTestCase):
         self.assertIsNone(program.Stack.pull_request_number('https://bugs.webkit.org/show_bug.cgi?id=320031'))
         self.assertIsNone(program.Stack.pull_request_number('eng/parent'))
 
-    def test_pull_request_stacked_on(self):
+    def test_pull_request_stacked_on(self) -> None:
         with OutputCapture(level=logging.INFO), mocks.remote.GitHub() as github, mocks.local.Git(
             self.path, remote=f'https://{github.remote}',
             remotes={'fork': f'https://{github.hosts[0]}/Contributor/WebKit'},
@@ -1131,7 +1133,7 @@ class TestStack(testing.PathTestCase):
                 '    - eng/child (this pull request)',
             )
 
-    def test_pull_request_stacked_on_url(self):
+    def test_pull_request_stacked_on_url(self) -> None:
         with OutputCapture(level=logging.INFO), mocks.remote.GitHub() as github, mocks.local.Git(
             self.path, remote=f'https://{github.remote}',
             remotes={'fork': f'https://{github.hosts[0]}/Contributor/WebKit'},
@@ -1153,7 +1155,7 @@ class TestStack(testing.PathTestCase):
                 'eng/parent',
             )
 
-    def test_pull_request_stacked_on_branch_name(self):
+    def test_pull_request_stacked_on_branch_name(self) -> None:
         with OutputCapture(level=logging.INFO), mocks.remote.GitHub() as github, mocks.local.Git(
             self.path, remote=f'https://{github.remote}',
             remotes={'fork': f'https://{github.hosts[0]}/Contributor/WebKit'},
@@ -1172,7 +1174,7 @@ class TestStack(testing.PathTestCase):
             self.assertEqual(created.base, 'main')
             self.assertEqual([commit.hash for commit in created.commits], [repo.commits['eng/child'][-1].hash])
 
-    def test_pull_request_stacked_on_issue(self):
+    def test_pull_request_stacked_on_issue(self) -> None:
         with OutputCapture(level=logging.INFO), mocks.remote.GitHub() as github, mocks.local.Git(
             self.path, remote=f'https://{github.remote}',
             remotes={'fork': f'https://{github.hosts[0]}/Contributor/WebKit'},
@@ -1190,7 +1192,7 @@ class TestStack(testing.PathTestCase):
                 'eng/parent',
             )
 
-    def test_pull_request_stacked_on_unknown(self):
+    def test_pull_request_stacked_on_unknown(self) -> None:
         with OutputCapture() as captured, mocks.remote.GitHub() as github, mocks.local.Git(
             self.path, remote=f'https://{github.remote}',
             remotes={'fork': f'https://{github.hosts[0]}/Contributor/WebKit'},
@@ -1206,7 +1208,7 @@ class TestStack(testing.PathTestCase):
             captured.stderr.getvalue(),
         )
 
-    def test_pull_request_stacked_on_missing_branch(self):
+    def test_pull_request_stacked_on_missing_branch(self) -> None:
         with OutputCapture() as captured, mocks.remote.GitHub() as github, mocks.local.Git(
             self.path, remote=f'https://{github.remote}',
             remotes={'fork': f'https://{github.hosts[0]}/Contributor/WebKit'},
@@ -1229,7 +1231,7 @@ class TestStack(testing.PathTestCase):
         )
         self.assertIn("Fetch that branch before stacking 'eng/child' on it\n", captured.stderr.getvalue())
 
-    def test_pull_request_stacked_on_merged(self):
+    def test_pull_request_stacked_on_merged(self) -> None:
         with OutputCapture() as captured, mocks.remote.GitHub() as github, mocks.local.Git(
             self.path, remote=f'https://{github.remote}',
             remotes={'fork': f'https://{github.hosts[0]}/Contributor/WebKit'},
@@ -1248,8 +1250,8 @@ class TestStack(testing.PathTestCase):
 
         self.assertIn('has already been merged, there is nothing to stack on\n', captured.stderr.getvalue())
 
-    def test_rebase_conflict_explains_how_to_resume(self):
-        def fail(git, step):
+    def test_rebase_conflict_explains_how_to_resume(self) -> None:
+        def fail(git: local.Git, step: Rebase) -> int:
             return 1
 
         with OutputCapture() as captured, mocks.local.Git(self.path) as repo, mocks.local.Svn(), \
@@ -1262,8 +1264,8 @@ class TestStack(testing.PathTestCase):
 
         self.assertIn("stack --rebase' to replay the rest of the stack", captured.stderr.getvalue())
 
-    def test_stack_on_conflict_keeps_the_parent_to_finish(self):
-        def fail(git, step):
+    def test_stack_on_conflict_keeps_the_parent_to_finish(self) -> None:
+        def fail(git: local.Git, step: Rebase) -> int:
             os.mkdir(os.path.join(self.path, '.git', 'rebase-merge'))
             return 1
 
@@ -1298,7 +1300,7 @@ class TestStack(testing.PathTestCase):
         )
         self.assertNotIn('Nothing was changed', captured.stderr.getvalue())
 
-    def test_re_parenting_forgets_the_old_dependency(self):
+    def test_re_parenting_forgets_the_old_dependency(self) -> None:
         with OutputCapture() as captured, mocks.local.Git(self.path) as repo, mocks.local.Svn(), bmocks.Bugzilla(
             BUGZILLA.split('://')[-1],
             issues=bmocks.ISSUES,
@@ -1341,7 +1343,7 @@ class TestStack(testing.PathTestCase):
         )
         self.assertIn('no longer depends on', captured.stdout.getvalue())
 
-    def test_unstack_forgets_the_dependency(self):
+    def test_unstack_forgets_the_dependency(self) -> None:
         with OutputCapture() as captured, mocks.local.Git(self.path) as repo, mocks.local.Svn(), bmocks.Bugzilla(
             BUGZILLA.split('://')[-1],
             issues=bmocks.ISSUES,
@@ -1361,7 +1363,7 @@ class TestStack(testing.PathTestCase):
 
         self.assertIn('no longer depends on', captured.stdout.getvalue())
 
-    def test_pull_request_no_rebase_detects_broken_stack(self):
+    def test_pull_request_no_rebase_detects_broken_stack(self) -> None:
         with OutputCapture() as captured, mocks.remote.GitHub() as github, mocks.local.Git(
             self.path, remote=f'https://{github.remote}',
             remotes={'fork': f'https://{github.hosts[0]}/Contributor/WebKit'},
@@ -1395,7 +1397,7 @@ class TestStack(testing.PathTestCase):
         self.assertIn("pull-request --rebase' to replay it", lines[1])
 
     @classmethod
-    def add_stack_with_bugs(cls, repo):
+    def add_stack_with_bugs(cls, repo: mocks.local.Git) -> mocks.local.Git:
         repo.commits['eng/parent'] = [
             repo.commits[repo.default_branch][-1],
             Commit(
@@ -1422,7 +1424,7 @@ class TestStack(testing.PathTestCase):
         return repo
 
     @classmethod
-    def add_stack_with_radars(cls, repo):
+    def add_stack_with_radars(cls, repo: mocks.local.Git) -> mocks.local.Git:
         repo.commits['eng/parent'] = [
             repo.commits[repo.default_branch][-1],
             Commit(
@@ -1448,7 +1450,7 @@ class TestStack(testing.PathTestCase):
         repo.head = repo.commits['eng/child'][-1]
         return repo
 
-    def test_pull_request_relates_issues(self):
+    def test_pull_request_relates_issues(self) -> None:
         with OutputCapture() as captured, mocks.remote.GitHub() as github, mocks.local.Git(
             self.path, remote=f'https://{github.remote}',
             remotes={'fork': f'https://{github.hosts[0]}/Contributor/WebKit'},
@@ -1477,7 +1479,7 @@ class TestStack(testing.PathTestCase):
             captured.stdout.getvalue(),
         )
 
-    def test_pull_request_no_issue_skips_relating(self):
+    def test_pull_request_no_issue_skips_relating(self) -> None:
         with OutputCapture() as captured, mocks.remote.GitHub() as github, mocks.local.Git(
             self.path, remote=f'https://{github.remote}',
             remotes={'fork': f'https://{github.hosts[0]}/Contributor/WebKit'},
@@ -1499,7 +1501,7 @@ class TestStack(testing.PathTestCase):
 
         self.assertNotIn('depends on', captured.stdout.getvalue())
 
-    def test_pull_request_relates_issues_once(self):
+    def test_pull_request_relates_issues_once(self) -> None:
         with OutputCapture() as captured, mocks.remote.GitHub() as github, mocks.local.Git(
             self.path, remote=f'https://{github.remote}',
             remotes={'fork': f'https://{github.hosts[0]}/Contributor/WebKit'},
@@ -1528,7 +1530,7 @@ class TestStack(testing.PathTestCase):
             1,
         )
 
-    def test_pull_request_relates_radars(self):
+    def test_pull_request_relates_radars(self) -> None:
         with OutputCapture() as captured, mocks.remote.GitHub() as github, mocks.local.Git(
             self.path, remote=f'https://{github.remote}',
             remotes={'fork': f'https://{github.hosts[0]}/Contributor/WebKit'},
@@ -1549,7 +1551,7 @@ class TestStack(testing.PathTestCase):
 
         self.assertIn('rdar://2 blocked by rdar://1', captured.stdout.getvalue())
 
-    def test_pull_request_relates_radars_once(self):
+    def test_pull_request_relates_radars_once(self) -> None:
         with OutputCapture() as captured, mocks.remote.GitHub() as github, mocks.local.Git(
             self.path, remote=f'https://{github.remote}',
             remotes={'fork': f'https://{github.hosts[0]}/Contributor/WebKit'},
@@ -1567,7 +1569,7 @@ class TestStack(testing.PathTestCase):
 
         self.assertEqual(captured.stdout.getvalue().count('rdar://2 blocked by rdar://1'), 1)
 
-    def test_issues_for_falls_back_to_branch_config(self):
+    def test_issues_for_falls_back_to_branch_config(self) -> None:
         with OutputCapture(), mocks.local.Git(self.path) as repo, mocks.local.Svn(), bmocks.Bugzilla(
             BUGZILLA.split('://')[-1],
             issues=bmocks.ISSUES,
@@ -1586,7 +1588,7 @@ class TestStack(testing.PathTestCase):
             )
 
     @classmethod
-    def add_stack_with_bugs_and_radars(cls, repo):
+    def add_stack_with_bugs_and_radars(cls, repo: mocks.local.Git) -> mocks.local.Git:
         repo.commits['eng/parent'] = [
             repo.commits[repo.default_branch][-1],
             Commit(
@@ -1612,7 +1614,7 @@ class TestStack(testing.PathTestCase):
         repo.head = repo.commits['eng/child'][-1]
         return repo
 
-    def test_pull_request_relates_each_tracker_to_its_own(self):
+    def test_pull_request_relates_each_tracker_to_its_own(self) -> None:
         with OutputCapture() as captured, mocks.remote.GitHub() as github, mocks.local.Git(
             self.path, remote=f'https://{github.remote}',
             remotes={'fork': f'https://{github.hosts[0]}/Contributor/WebKit'},

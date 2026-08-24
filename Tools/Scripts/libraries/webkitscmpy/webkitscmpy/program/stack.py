@@ -24,14 +24,21 @@ import os
 import re
 import sys
 
-from collections import namedtuple
+from argparse import ArgumentParser, Namespace
+from typing import NamedTuple, Optional
+
 from .command import Command
 
-from webkitbugspy import Tracker, radar
+from webkitbugspy import Issue, Tracker, radar
 from webkitcorepy import arguments, run, Version
-from webkitscmpy import local, log
+from webkitscmpy import Commit, PullRequest, local, log, remote
 
-Rebase = namedtuple('Rebase', ('branch', 'onto', 'base', 'update_refs'))
+
+class Rebase(NamedTuple):
+    branch: str
+    onto: str
+    base: str
+    update_refs: bool
 
 
 class Stack(Command):
@@ -45,7 +52,7 @@ class Stack(Command):
     PULL_REQUEST_RE = re.compile(r'(?:^|/pull/)(?P<number>\d+)(?:/|$)')
 
     @classmethod
-    def parser(cls, parser, loggers=None):
+    def parser(cls, parser: ArgumentParser, loggers: Optional[list] = None) -> None:
         parser.add_argument(
             '--rebase', '--no-rebase',
             dest='rebase', default=None,
@@ -72,16 +79,16 @@ class Stack(Command):
         )
 
     @classmethod
-    def _key_for(cls, branch, key=None):
+    def _key_for(cls, branch: str, key: Optional[str] = None) -> str:
         return f'branch.{branch}.{key or cls.PARENT_KEY}'
 
     @classmethod
-    def _base(cls, git, branch):
+    def _base(cls, git: local.Git, branch: str) -> Optional[str]:
         """The parent's tip as of the last time 'branch' was known to sit on top of it."""
         return git.config().get(cls._key_for(branch, cls.BASE_KEY)) or None
 
     @classmethod
-    def _set_base(cls, git, branch, parent):
+    def _set_base(cls, git: local.Git, branch: str, parent: str) -> int:
         if not (tip := git.commit(branch=parent, include_log=False, include_identifier=False)):
             sys.stderr.write(f"Failed to resolve the tip of '{parent}'\n")
             return 1
@@ -93,7 +100,7 @@ class Stack(Command):
         return 0
 
     @classmethod
-    def recorded_parent(cls, git, branch):
+    def recorded_parent(cls, git: local.Git, branch: Optional[str]) -> Optional[str]:
         """The branch a change claims to be stacked on, whether or not this checkout has it."""
         if not isinstance(git, local.Git) or not branch:
             return None
@@ -101,7 +108,7 @@ class Stack(Command):
         return None if not candidate or candidate == branch else candidate
 
     @classmethod
-    def parent(cls, git, branch):
+    def parent(cls, git: local.Git, branch: Optional[str]) -> Optional[str]:
         """The branch a change is stacked on, or None when there is nothing to replay onto."""
         if not (candidate := cls.recorded_parent(git, branch)):
             return None
@@ -111,7 +118,7 @@ class Stack(Command):
         return candidate
 
     @classmethod
-    def missing_parent(cls, git, branch):
+    def missing_parent(cls, git: local.Git, branch: Optional[str]) -> int:
         """1 if a change claims a parent this checkout does not have, which nothing can act on."""
         recorded = cls.recorded_parent(git, branch)
         if not recorded or cls.parent(git, branch):
@@ -124,7 +131,7 @@ class Stack(Command):
         return 1
 
     @classmethod
-    def _parent_landed(cls, git, parent, remote):
+    def _parent_landed(cls, git: local.Git, parent: str, remote: Optional[str]) -> bool:
         """Whether a branch this checkout no longer has is gone because its pull-request was merged."""
         remote_repo = git.remote(name=remote or git.default_remote)
         if not remote_repo or not remote_repo.pull_requests:
@@ -138,7 +145,7 @@ class Stack(Command):
         return False
 
     @classmethod
-    def forget_landed_parent(cls, git, branch, remote=None):
+    def forget_landed_parent(cls, git: local.Git, branch: Optional[str], remote: Optional[str] = None) -> bool:
         """Drop a dependency on a parent which landed, since the production branch now carries it."""
         parent = cls.recorded_parent(git, branch)
         if not parent or cls.parent(git, branch) or not cls._parent_landed(git, parent, remote):
@@ -150,7 +157,7 @@ class Stack(Command):
         return True
 
     @classmethod
-    def _unset_parent(cls, git, branch):
+    def _unset_parent(cls, git: local.Git, branch: str) -> int:
         for key in (cls.PARENT_KEY, cls.BASE_KEY):
             command = [git.executable(), 'config', '--unset', cls._key_for(branch, key)]
             if run(command, cwd=git.root_path, capture_output=True).returncode and key == cls.PARENT_KEY:
@@ -160,7 +167,7 @@ class Stack(Command):
         return 0
 
     @classmethod
-    def _children(cls, git, branch):
+    def _children(cls, git: local.Git, branch: str) -> list[str]:
         prefix, suffix = 'branch.', f'.{cls.PARENT_KEY}'
         result = []
         for key, value in git.config().items():
@@ -172,7 +179,7 @@ class Stack(Command):
         return sorted(result)
 
     @classmethod
-    def _ancestors(cls, git, branch):
+    def _ancestors(cls, git: local.Git, branch: str) -> Optional[list[str]]:
         result = []
         candidate = branch
         while candidate := cls.parent(git, candidate):
@@ -183,7 +190,7 @@ class Stack(Command):
         return result[::-1]  # Bottom of stack to top
 
     @classmethod
-    def _descendants(cls, git, branch):  # DFS so children come before siblings
+    def _descendants(cls, git: local.Git, branch: str) -> Optional[list[str]]:  # DFS so children come before siblings
         result = []
         stack = list(reversed(cls._children(git, branch)))
         while stack:
@@ -196,7 +203,7 @@ class Stack(Command):
         return result
 
     @classmethod
-    def members(cls, git, branch):
+    def members(cls, git: local.Git, branch: str) -> Optional[list[str]]:
         if (below := cls._ancestors(git, branch)) is None:
             return None
         root = below[0] if below else branch
@@ -205,18 +212,18 @@ class Stack(Command):
         return [root] + above
 
     @classmethod
-    def _pull_request_for(cls, git, branch, remote_repo):
+    def _pull_request_for(cls, git: local.Git, branch: str, remote_repo: Optional[remote.Scm]) -> Optional[PullRequest]:
         if not remote_repo or not remote_repo.pull_requests:
             return None
         if not git.config().get(f'branch.{branch}.target'):
             return None
 
-        # Avoids a circular import
-        from .pull_request import PullRequest
-        return PullRequest.find_existing_pull_request(git, remote_repo, branch=branch)
+        # Avoids a circular import, and 'PullRequest' in this module is the pull-request itself
+        from .pull_request import PullRequest as PullRequestCommand
+        return PullRequestCommand.find_existing_pull_request(git, remote_repo, branch=branch)
 
     @classmethod
-    def describe(cls, git, branch, remote_repo=None):
+    def describe(cls, git: local.Git, branch: str, remote_repo: Optional[remote.Scm] = None) -> Optional[list[str]]:
         if (members := cls.members(git, branch)) is None:
             return None
         if len(members) < 2:
@@ -244,7 +251,7 @@ class Stack(Command):
         return lines
 
     @classmethod
-    def _supports_update_refs(cls, git):
+    def _supports_update_refs(cls, git: local.Git) -> bool:
         """git rebase --update-ref is available in 2.38."""
         result = run([git.executable(), '--version'], cwd=git.root_path, capture_output=True, encoding='utf-8')
         if result.returncode or not (match := re.search(r'(\d+)\.(\d+)(?:\.(\d+))?', result.stdout)):
@@ -252,15 +259,15 @@ class Stack(Command):
         return Version(*[int(group) for group in match.groups(default='0')]) >= cls.UPDATE_REFS_VERSION
 
     @classmethod
-    def _is_contiguous(cls, git, branch, parent):
+    def _is_contiguous(cls, git: local.Git, branch: str, parent: str) -> bool:
         """Whether 'branch' still descends from its parent's tip, so both can replay in one rebase."""
         tip = git.commit(branch=parent, include_log=False, include_identifier=False)
         return bool(tip) and cls._base(git, branch) == tip.hash
 
     @classmethod
-    def _rebase_plan(cls, git, members, trunk, branch_point) -> list[Rebase]:
+    def _rebase_plan(cls, git: local.Git, members: list[str], trunk: str, branch_point: Commit) -> list[Rebase]:
         """One rebase per run of branches that can replay together, bottom of the stack first."""
-        def rebase_for(member, parent):
+        def rebase_for(member: str, parent: Optional[str]) -> Rebase:
             if member == members[0]:
                 return Rebase(member, trunk, branch_point.hash, False)
             return Rebase(member, parent, cls._base(git, member) or parent, False)
@@ -279,14 +286,14 @@ class Stack(Command):
         return result
 
     @classmethod
-    def _rebase_in_progress(cls, git):
+    def _rebase_in_progress(cls, git: local.Git) -> bool:
         return any(
             os.path.isdir(os.path.join(git.git_directory, candidate))
             for candidate in ('rebase-merge', 'rebase-apply')
         )
 
     @classmethod
-    def rebase(cls, git, remote=None, prune=None):
+    def rebase(cls, git: local.Git, remote: Optional[str] = None, prune: Optional[bool] = None) -> int:
         # CHECKS
         if not (branch := git.branch):
             sys.stderr.write('HEAD is not on a branch, so there is no stack to rebase\n')
@@ -335,7 +342,7 @@ class Stack(Command):
         return 0
 
     @classmethod
-    def _rebase_onto(cls, git, step):
+    def _rebase_onto(cls, git: local.Git, step: Rebase) -> int:
         log.info(f"Rebasing '{step.branch}' on '{step.onto}'...")
         command = [git.executable(), 'rebase', '--onto', step.onto, step.base, step.branch, '--autostash']
         if step.update_refs:
@@ -347,12 +354,12 @@ class Stack(Command):
         return 0
 
     @classmethod
-    def pull_request_number(cls, argument):
-        match = cls.PULL_REQUEST_RE.search(str(argument))
+    def pull_request_number(cls, argument: str) -> Optional[int]:
+        match = cls.PULL_REQUEST_RE.search(argument)
         return int(match.group('number')) if match else None
 
     @classmethod
-    def _branch_for_pull_request(cls, git, remote_repo, number, branch=None):
+    def _branch_for_pull_request(cls, git: local.Git, remote_repo: Optional[remote.Scm], number: int, branch: Optional[str] = None) -> tuple[Optional[str], int]:
         """The local branch a pull-request is from, and 1 if it exists but cannot be stacked on."""
         if not remote_repo or not remote_repo.pull_requests:
             log.warning(f"Cannot look up pull-request #{number}, '{git.root_path}' has no remote which tracks them")
@@ -373,9 +380,9 @@ class Stack(Command):
         return pull_request.head, 0
 
     @classmethod
-    def _branch_for_issue(cls, git, argument):
+    def _branch_for_issue(cls, git: local.Git, argument: str) -> Optional[str]:
         """The local branch recorded against an issue, matched on the numbers in its url."""
-        if not (numbers := set(re.findall(r'\d+', str(argument)))):
+        if not (numbers := set(re.findall(r'\d+', argument))):
             return None
 
         # 'git config --get-regexp' reports every value, where config() keeps only the last
@@ -401,7 +408,7 @@ class Stack(Command):
         return candidate
 
     @classmethod
-    def resolve(cls, git, argument, remote_repo=None, branch=None):
+    def resolve(cls, git: local.Git, argument: str, remote_repo: Optional[remote.Scm] = None, branch: Optional[str] = None) -> Optional[str]:
         """The branch in this checkout a branch name, pull-request, or issue refers to."""
         from .branch import Branch
 
@@ -430,7 +437,7 @@ class Stack(Command):
         return candidate
 
     @classmethod
-    def issues_for(cls, git, branch, config=None):
+    def issues_for(cls, git: local.Git, branch: str, config: Optional[dict] = None) -> list[Issue]:
         commit = git.commit(branch=branch, include_log=True, include_identifier=False)
         if commit and commit.issues:
             return commit.issues
@@ -439,7 +446,9 @@ class Stack(Command):
         return [issue] if issue else []
 
     @classmethod
-    def _matching_issues(cls, git, branch, parent, issues=None):
+    def _matching_issues(
+        cls, git: local.Git, branch: str, parent: str, issues: Optional[list[Issue]] = None,
+    ) -> list[tuple[Issue, Issue, str]]:
         """Each of a branch's issues paired with the parent issue tracked by the same tracker."""
         parent_issues = cls.issues_for(git, parent)
         if not parent_issues:
@@ -460,7 +469,7 @@ class Stack(Command):
         return result
 
     @classmethod
-    def _apply_relations(cls, git, branch, parent, issues=None, related=True):
+    def _apply_relations(cls, git: local.Git, branch: str, parent: str, issues: Optional[list[Issue]] = None, related: bool = True) -> int:
         """Bring each issue's dependency on the parent's issue to 'related', leaving the rest alone."""
         for issue, match, relation in cls._matching_issues(git, branch, parent, issues=issues):
             label = f"{'' if related else 'no longer '}{relation.replace('_', ' ')}"
@@ -480,15 +489,15 @@ class Stack(Command):
         return 0
 
     @classmethod
-    def relate_issues(cls, git, branch, parent, issues=None):
+    def relate_issues(cls, git: local.Git, branch: str, parent: str, issues: Optional[list[Issue]] = None) -> int:
         return cls._apply_relations(git, branch, parent, issues=issues, related=True)
 
     @classmethod
-    def unrelate_issues(cls, git, branch, parent, issues=None):
+    def unrelate_issues(cls, git: local.Git, branch: str, parent: str, issues: Optional[list[Issue]] = None) -> int:
         return cls._apply_relations(git, branch, parent, issues=issues, related=False)
 
     @classmethod
-    def _set_parent(cls, git, branch, parent):
+    def _set_parent(cls, git: local.Git, branch: str, parent: str) -> int:
         command = [git.executable(), 'config', cls._key_for(branch), parent]
         if run(command, cwd=git.root_path, capture_output=True).returncode:
             sys.stderr.write(f"Failed to record that '{branch}' is stacked on '{parent}'\n")
@@ -497,7 +506,7 @@ class Stack(Command):
         return 0
 
     @classmethod
-    def _record_parent(cls, git, branch, parent, base=None):
+    def _record_parent(cls, git: local.Git, branch: str, parent: Optional[str], base: Optional[str] = None) -> int:
         """Write the parent a branch is stacked on, and the base it sits at, verbatim."""
         if not parent:
             return cls._unset_parent(git, branch)
@@ -511,7 +520,7 @@ class Stack(Command):
         return 0
 
     @classmethod
-    def stack_on(cls, git, branch, parent):
+    def stack_on(cls, git: local.Git, branch: str, parent: str) -> int:
         """Record that 'branch' is stacked on 'parent,' and put it there."""
         previous, base = cls.parent(git, branch), cls._base(git, branch)
         if cls._set_parent(git, branch, parent):
@@ -532,7 +541,7 @@ class Stack(Command):
         return 1
 
     @classmethod
-    def _restack(cls, git, branch, parent):
+    def _restack(cls, git: local.Git, branch: str, parent: str) -> int:
         command = [git.executable(), 'merge-base', '--is-ancestor', parent, branch]
         if not run(command, cwd=git.root_path, capture_output=True).returncode:
             return cls._set_base(git, branch, parent)
@@ -550,7 +559,7 @@ class Stack(Command):
         return cls._set_base(git, branch, parent)
 
     @classmethod
-    def main(cls, args, repository, **kwargs):
+    def main(cls, args: Namespace, repository, **kwargs) -> int:
         if not isinstance(repository, local.Git):
             sys.stderr.write(f"Can only '{cls.name}' on a native Git repository\n")
             return 1

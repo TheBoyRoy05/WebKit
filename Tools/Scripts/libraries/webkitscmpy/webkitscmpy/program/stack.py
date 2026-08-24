@@ -28,7 +28,7 @@ from collections import namedtuple
 from .command import Command
 
 from webkitbugspy import Tracker, radar
-from webkitcorepy import run, Version
+from webkitcorepy import arguments, run, Version
 from webkitscmpy import local, log
 
 Rebase = namedtuple('Rebase', ('branch', 'onto', 'base', 'update_refs'))
@@ -47,8 +47,12 @@ class Stack(Command):
     @classmethod
     def parser(cls, parser, loggers=None):
         parser.add_argument(
-            '--rebase', dest='rebase', action='store_true', default=False,
-            help='Rebase every branch in the stack onto the branch beneath it',
+            '--rebase', '--no-rebase',
+            dest='rebase', default=None,
+            help='Replay the whole stack, each branch onto the one beneath it and the bottom onto '
+                 'the production branch. Changing which branch a change is stacked on does this '
+                 'unless told not to, but always puts that change on its parent',
+            action=arguments.NoAction,
         )
         parser.add_argument(
             '--on', '--stacked-on',
@@ -101,15 +105,6 @@ class Stack(Command):
             log.warning(f"'{branch}' is stacked on '{candidate}', which no longer exists in this checkout")
             return None
         return candidate
-
-    @classmethod
-    def _set_parent(cls, git, branch, parent):
-        command = [git.executable(), 'config', cls._key_for(branch), parent]
-        if run(command, cwd=git.root_path, capture_output=True).returncode:
-            sys.stderr.write(f"Failed to record that '{branch}' is stacked on '{parent}'\n")
-            return 1
-        git.config(cached=False)
-        return 0
 
     @classmethod
     def _unset_parent(cls, git, branch):
@@ -241,11 +236,18 @@ class Stack(Command):
         return result
 
     @classmethod
+    def _rebase_in_progress(cls, git):
+        return any(
+            os.path.isdir(os.path.join(git.git_directory, candidate))
+            for candidate in ('rebase-merge', 'rebase-apply')
+        )
+
+    @classmethod
     def rebase(cls, git, remote=None, prune=None):
         # CHECKS
         if not (branch := git.branch):
             sys.stderr.write('HEAD is not on a branch, so there is no stack to rebase\n')
-            if any(os.path.isdir(os.path.join(git.git_directory, candidate)) for candidate in ('rebase-merge', 'rebase-apply')):
+            if cls._rebase_in_progress(git):
                 sys.stderr.write("Finish the rebase in progress with 'git rebase --continue' or 'git rebase --abort'\n")
             return 1
 
@@ -440,9 +442,48 @@ class Stack(Command):
         return cls._apply_relations(git, branch, parent, issues=issues, related=False)
 
     @classmethod
+    def _set_parent(cls, git, branch, parent):
+        command = [git.executable(), 'config', cls._key_for(branch), parent]
+        if run(command, cwd=git.root_path, capture_output=True).returncode:
+            sys.stderr.write(f"Failed to record that '{branch}' is stacked on '{parent}'\n")
+            return 1
+        git.config(cached=False)
+        return 0
+
+    @classmethod
+    def _record_parent(cls, git, branch, parent, base=None):
+        """Write the parent a branch is stacked on, and the base it sits at, verbatim."""
+        if not parent:
+            return cls._unset_parent(git, branch)
+
+        for key, value in ((cls.PARENT_KEY, parent), (cls.BASE_KEY, base)):
+            command = [git.executable(), 'config', cls._key_for(branch, key), value] if value else [
+                git.executable(), 'config', '--unset', cls._key_for(branch, key),
+            ]
+            run(command, cwd=git.root_path, capture_output=True)
+        git.config(cached=False)
+        return 0
+
+    @classmethod
     def stack_on(cls, git, branch, parent):
         """Record that 'branch' is stacked on 'parent,' and put it there."""
-        return cls._set_parent(git, branch, parent) or cls._restack(git, branch, parent)
+        previous, base = cls.parent(git, branch), cls._base(git, branch)
+        if cls._set_parent(git, branch, parent):
+            return 1
+        if not cls._restack(git, branch, parent):
+            return 0
+
+        # A conflict leaves the replay to be finished by hand, so the parent it will sit on stays
+        if cls._rebase_in_progress(git):
+            sys.stderr.write(f"Finish stacking '{branch}' on '{parent}' with 'git rebase --continue'\n")
+            return 1
+
+        cls._record_parent(git, branch, previous, base=base)
+        if previous:
+            sys.stderr.write(f"Nothing was changed, '{branch}' is still stacked on '{previous}'\n")
+        else:
+            sys.stderr.write(f"Nothing was changed, '{branch}' is not stacked on another branch\n")
+        return 1
 
     @classmethod
     def _restack(cls, git, branch, parent):
@@ -459,7 +500,6 @@ class Stack(Command):
             base = result.stdout.strip()
 
         if cls._rebase_onto(git, Rebase(branch, parent, base, False)):
-            sys.stderr.write(f"Then run 'git rebase --continue' to finish stacking '{branch}' on '{parent}'\n")
             return 1
         return cls._set_base(git, branch, parent)
 
@@ -492,7 +532,7 @@ class Stack(Command):
             if cls.stack_on(git, branch, parent):
                 return 1
             print(f"'{branch}' is stacked on '{parent}'")
-            return cls.rebase(git, remote=args.remote) if args.rebase else 0
+            return 0 if args.rebase is False else cls.rebase(git, remote=args.remote)
 
         if args.unstack:
             if parent := cls.parent(git, branch):
@@ -503,7 +543,9 @@ class Stack(Command):
             print(f"'{branch}' is no longer stacked on another branch")
 
             # Nothing sits beneath it any more, so replay it onto the branch it will be merged into
-            return cls.rebase(git, remote=args.remote) if was_stacked else 0
+            if not was_stacked or args.rebase is False:
+                return 0
+            return cls.rebase(git, remote=args.remote)
 
         if args.rebase and (result := cls.rebase(git, remote=args.remote)):
             return result

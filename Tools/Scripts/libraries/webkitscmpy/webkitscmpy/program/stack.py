@@ -93,18 +93,61 @@ class Stack(Command):
         return 0
 
     @classmethod
-    def parent(cls, git, branch):
+    def recorded_parent(cls, git, branch):
+        """The branch a change claims to be stacked on, whether or not this checkout has it."""
         if not isinstance(git, local.Git) or not branch:
             return None
-
         candidate = git.config().get(cls._key_for(branch))
-        if not candidate or candidate == branch:
-            return None
+        return None if not candidate or candidate == branch else candidate
 
+    @classmethod
+    def parent(cls, git, branch):
+        """The branch a change is stacked on, or None when there is nothing to replay onto."""
+        if not (candidate := cls.recorded_parent(git, branch)):
+            return None
         if candidate not in git.branches_for(remote=False):
             log.warning(f"'{branch}' is stacked on '{candidate}', which no longer exists in this checkout")
             return None
         return candidate
+
+    @classmethod
+    def missing_parent(cls, git, branch):
+        """1 if a change claims a parent this checkout does not have, which nothing can act on."""
+        recorded = cls.recorded_parent(git, branch)
+        if not recorded or cls.parent(git, branch):
+            return 0
+
+        sys.stderr.write(f"'{branch}' is stacked on '{recorded},' which does not exist in this checkout\n")
+        sys.stderr.write(
+            f"Fetch it, or run '{os.path.basename(sys.argv[0])} stack --unstack' to forget it\n"
+        )
+        return 1
+
+    @classmethod
+    def _parent_landed(cls, git, parent, remote):
+        """Whether a branch this checkout no longer has is gone because its pull-request was merged."""
+        remote_repo = git.remote(name=remote or git.default_remote)
+        if not remote_repo or not remote_repo.pull_requests:
+            return False
+
+        # Deleting a branch takes 'branch.<name>.*' with it, so its name is all a parent leaves behind
+        for pull_request in remote_repo.pull_requests.find(opened=None, head=parent):
+            # Searching cannot report whether a pull-request merged, only fetching one can
+            if (candidate := remote_repo.pull_requests.get(pull_request.number)) and candidate.merged:
+                return True
+        return False
+
+    @classmethod
+    def forget_landed_parent(cls, git, branch, remote=None):
+        """Drop a dependency on a parent which landed, since the production branch now carries it."""
+        parent = cls.recorded_parent(git, branch)
+        if not parent or cls.parent(git, branch) or not cls._parent_landed(git, parent, remote):
+            return False
+        if cls._unset_parent(git, branch):
+            return False
+
+        print(f"'{parent}' has landed, so '{branch}' is no longer stacked on it")
+        return True
 
     @classmethod
     def _unset_parent(cls, git, branch):
@@ -251,6 +294,9 @@ class Stack(Command):
                 sys.stderr.write("Finish the rebase in progress with 'git rebase --continue' or 'git rebase --abort'\n")
             return 1
 
+        cls.forget_landed_parent(git, branch, remote=remote)
+        if cls.missing_parent(git, branch):
+            return 1
         if (members := cls.members(git, branch)) is None:
             return 1
 

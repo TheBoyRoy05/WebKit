@@ -484,6 +484,9 @@ class PullRequest(Command):
     @classmethod
     def ensure_stack_parent(cls, args, repository):
         """The branch this one is stacked on, recording and replaying onto a newly provided one."""
+        Stack.forget_landed_parent(repository, repository.branch, remote=getattr(args, 'remote', None))
+        if Stack.missing_parent(repository, repository.branch):
+            return None, 1
         stack_parent = Stack.parent(repository, repository.branch)
 
         # 'pull_request_branch_point' resolved '--stacked-on' once the source remote was known

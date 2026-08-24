@@ -473,6 +473,144 @@ class TestStack(testing.PathTestCase):
             "'eng/child' is not part of a stack\n",
         )
 
+    def test_parent_deleted_refuses_to_rebase(self):
+        with OutputCapture() as captured, mocks.local.Git(self.path) as repo, mocks.local.Svn(), \
+                patch('webkitbugspy.Tracker._trackers', []), MockTime:
+            self.add_stack(repo)
+            self.assertEqual(0, program.main(args=('stack', '--on', 'eng/parent'), path=self.path))
+            before = repo.commits['eng/child'][0].hash
+
+            # A renamed or deleted parent leaves the name behind, pointing at nothing
+            repo.edit_config('branch.eng/child.stack-parent', 'eng/renamed-away')
+
+            # Replaying would quietly put 'eng/child' on the production branch instead
+            self.assertEqual(1, program.main(args=('stack', '--rebase'), path=self.path))
+            self.assertEqual(repo.commits['eng/child'][0].hash, before)
+
+        self.assertIn(
+            "'eng/child' is stacked on 'eng/renamed-away,' which does not exist in this checkout",
+            captured.stderr.getvalue(),
+        )
+        self.assertIn("stack --unstack' to forget it", captured.stderr.getvalue())
+
+    def test_parent_deleted_refuses_to_upload(self):
+        with OutputCapture() as captured, mocks.remote.GitHub() as github, mocks.local.Git(
+            self.path, remote=f'https://{github.remote}',
+            remotes={'fork': f'https://{github.hosts[0]}/Contributor/WebKit'},
+        ) as repo, mocks.local.Svn(), patch('webkitbugspy.Tracker._trackers', []):
+            self.add_stack(repo)
+            self.assertEqual(0, program.main(args=('stack', '--on', 'eng/parent'), path=self.path))
+            repo.edit_config('branch.eng/child.stack-parent', 'eng/renamed-away')
+
+            # Uploading would widen the commit range back over the parent without saying so
+            self.assertEqual(1, program.main(args=('pull-request', '--no-history'), path=self.path))
+            self.assertEqual(len(github.pull_requests), 0)
+
+        self.assertIn(
+            "'eng/child' is stacked on 'eng/renamed-away,' which does not exist in this checkout",
+            captured.stderr.getvalue(),
+        )
+
+    def test_landed_parent_is_forgotten_before_rebase(self):
+        with OutputCapture() as captured, mocks.remote.GitHub() as github, mocks.local.Git(
+            self.path, remote=f'https://{github.remote}',
+            remotes={'fork': f'https://{github.hosts[0]}/Contributor/WebKit'},
+        ) as repo, mocks.local.Svn(), patch('webkitbugspy.Tracker._trackers', []):
+            self.add_stack(repo)
+            repo.head = repo.commits['eng/parent'][-1]
+            self.assertEqual(0, program.main(args=('pull-request', '--no-history'), path=self.path))
+
+            repo.head = repo.commits['eng/child'][-1]
+            self.assertEqual(0, program.main(args=('stack', '--on', 'eng/parent'), path=self.path))
+
+            # Landing a pull-request deletes the branch it came from, leaving only the name behind
+            github.pull_requests[0]['merged'] = True
+            github.pull_requests[0]['head']['ref'] = 'eng/landed'
+            repo.edit_config('branch.eng/child.stack-parent', 'eng/landed')
+
+            self.assertEqual(0, program.main(args=('stack', '--rebase'), path=self.path))
+            config = local.Git(self.path).config()
+            self.assertIsNone(config.get('branch.eng/child.stack-parent'))
+            self.assertIsNone(config.get('branch.eng/child.stack-base'))
+
+        self.assertEqual(captured.stderr.getvalue(), '')
+        self.assertIn(
+            "'eng/landed' has landed, so 'eng/child' is no longer stacked on it",
+            captured.stdout.getvalue(),
+        )
+
+    def test_landed_parent_is_forgotten_before_upload(self):
+        with OutputCapture() as captured, mocks.remote.GitHub() as github, mocks.local.Git(
+            self.path, remote=f'https://{github.remote}',
+            remotes={'fork': f'https://{github.hosts[0]}/Contributor/WebKit'},
+        ) as repo, mocks.local.Svn(), patch('webkitbugspy.Tracker._trackers', []):
+            self.add_stack(repo)
+            repo.head = repo.commits['eng/parent'][-1]
+            self.assertEqual(0, program.main(args=('pull-request', '--no-history'), path=self.path))
+
+            repo.head = repo.commits['eng/child'][-1]
+            self.assertEqual(0, program.main(args=('stack', '--on', 'eng/parent'), path=self.path))
+
+            github.pull_requests[0]['merged'] = True
+            github.pull_requests[0]['head']['ref'] = 'eng/landed'
+            repo.edit_config('branch.eng/child.stack-parent', 'eng/landed')
+
+            self.assertEqual(0, program.main(args=('pull-request', '--no-history'), path=self.path))
+            self.assertEqual(len(github.pull_requests), 2)
+            self.assertIsNone(local.Git(self.path).config().get('branch.eng/child.stack-parent'))
+
+        self.assertIn(
+            "'eng/landed' has landed, so 'eng/child' is no longer stacked on it",
+            captured.stdout.getvalue(),
+        )
+
+    def test_landed_parent_which_still_exists_is_left_alone(self):
+        with OutputCapture(), mocks.remote.GitHub() as github, mocks.local.Git(
+            self.path, remote=f'https://{github.remote}',
+            remotes={'fork': f'https://{github.hosts[0]}/Contributor/WebKit'},
+        ) as repo, mocks.local.Svn(), patch('webkitbugspy.Tracker._trackers', []):
+            self.add_stack(repo)
+            repo.head = repo.commits['eng/parent'][-1]
+            self.assertEqual(0, program.main(args=('pull-request', '--no-history'), path=self.path))
+            github.pull_requests[0]['merged'] = True
+
+            repo.head = repo.commits['eng/child'][-1]
+            self.assertEqual(0, program.main(args=('stack', '--on', 'eng/parent'), path=self.path))
+
+            # A branch which is still here can still be replayed onto, so replaying asks the remote nothing
+            self.assertEqual(0, program.main(args=('stack', '--rebase'), path=self.path))
+            self.assertEqual(
+                local.Git(self.path).config().get('branch.eng/child.stack-parent'),
+                'eng/parent',
+            )
+
+    def test_parent_with_an_open_pull_request_still_refuses(self):
+        with OutputCapture() as captured, mocks.remote.GitHub() as github, mocks.local.Git(
+            self.path, remote=f'https://{github.remote}',
+            remotes={'fork': f'https://{github.hosts[0]}/Contributor/WebKit'},
+        ) as repo, mocks.local.Svn(), patch('webkitbugspy.Tracker._trackers', []):
+            self.add_stack(repo)
+            repo.head = repo.commits['eng/parent'][-1]
+            self.assertEqual(0, program.main(args=('pull-request', '--no-history'), path=self.path))
+
+            repo.head = repo.commits['eng/child'][-1]
+            self.assertEqual(0, program.main(args=('stack', '--on', 'eng/parent'), path=self.path))
+
+            # A parent which has not landed is lost, not satisfied, so its dependency stands
+            github.pull_requests[0]['head']['ref'] = 'eng/lost'
+            repo.edit_config('branch.eng/child.stack-parent', 'eng/lost')
+
+            self.assertEqual(1, program.main(args=('stack', '--rebase'), path=self.path))
+            self.assertEqual(
+                local.Git(self.path).config().get('branch.eng/child.stack-parent'),
+                'eng/lost',
+            )
+
+        self.assertIn(
+            "'eng/child' is stacked on 'eng/lost,' which does not exist in this checkout",
+            captured.stderr.getvalue(),
+        )
+
     def test_listing(self):
         with OutputCapture() as captured, mocks.local.Git(self.path) as repo, mocks.local.Svn(), \
                 patch('webkitbugspy.Tracker._trackers', []), MockTime:

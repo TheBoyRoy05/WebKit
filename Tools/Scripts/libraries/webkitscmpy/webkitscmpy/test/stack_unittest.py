@@ -613,6 +613,298 @@ class TestStack(testing.PathTestCase):
             captured.stderr.getvalue(),
         )
 
+    def test_stacking_publishes_the_stack(self) -> None:
+        with OutputCapture(), mocks.remote.GitHub() as github, mocks.local.Git(
+            self.path, remote=f'https://{github.remote}',
+            remotes={'fork': f'https://{github.hosts[0]}/Contributor/WebKit'},
+        ) as repo, mocks.local.Svn(), patch('webkitbugspy.Tracker._trackers', []):
+            self.add_stack(repo)
+            self.assertEqual(0, program.main(args=('stack', '--on', 'eng/parent'), path=self.path))
+
+            self.assertEqual(
+                repo.blobs[repo.remote_refs['fork']['refs/stacks/eng/child']],
+                f"parent: eng/parent\nbase: {repo.commits['eng/parent'][-1].hash}\n",
+            )
+
+    def test_uploading_publishes_a_stack_recorded_before_it_could_be(self) -> None:
+        with OutputCapture(), mocks.remote.GitHub() as github, mocks.local.Git(
+            self.path, remote=f'https://{github.remote}',
+            remotes={'fork': f'https://{github.hosts[0]}/Contributor/WebKit'},
+        ) as repo, mocks.local.Svn(), patch('webkitbugspy.Tracker._trackers', []):
+            self.add_stack(repo)
+
+            # A stack recorded by a version of the tool which could not publish it, or while offline
+            repo.edit_config('branch.eng/child.stack-parent', 'eng/parent')
+            repo.edit_config('branch.eng/child.stack-base', repo.commits['eng/parent'][-1].hash)
+
+            self.assertEqual(0, program.main(args=('pull-request', '--no-history'), path=self.path))
+            self.assertEqual(
+                repo.blobs[repo.remote_refs['fork']['refs/stacks/eng/child']],
+                f"parent: eng/parent\nbase: {repo.commits['eng/parent'][-1].hash}\n",
+            )
+
+    def test_a_checkout_which_has_never_seen_the_stack_adopts_it(self) -> None:
+        with OutputCapture() as captured, mocks.remote.GitHub() as github, mocks.local.Git(
+            self.path, remote=f'https://{github.remote}',
+            remotes={'fork': f'https://{github.hosts[0]}/Contributor/WebKit'},
+        ) as repo, mocks.local.Svn(), patch('webkitbugspy.Tracker._trackers', []):
+            self.add_stack(repo)
+            self.assertEqual(0, program.main(args=('stack', '--on', 'eng/parent'), path=self.path))
+            self.assertEqual(0, program.main(args=('pull-request', '--no-history'), path=self.path))
+
+            # Another checkout of the same fork has the branches, but none of the config which stacks them
+            repo.edit_config('branch.eng/child.stack-parent', None)
+            repo.edit_config('branch.eng/child.stack-base', None)
+            repo.refs = {}
+            self.assertIsNone(local.Git(self.path).config().get('branch.eng/child.stack-parent'))
+
+            self.assertEqual(0, program.main(args=('stack',), path=self.path))
+            config = local.Git(self.path).config()
+            self.assertEqual(config.get('branch.eng/child.stack-parent'), 'eng/parent')
+            self.assertEqual(
+                config.get('branch.eng/child.stack-base'),
+                repo.commits['eng/parent'][-1].hash,
+            )
+
+        self.assertIn('Stacked pull requests, bottom of the stack first:', captured.stdout.getvalue())
+
+    def test_a_published_stack_the_branch_has_left_is_not_adopted(self) -> None:
+        with OutputCapture() as captured, mocks.remote.GitHub() as github, mocks.local.Git(
+            self.path, remote=f'https://{github.remote}',
+            remotes={'fork': f'https://{github.hosts[0]}/Contributor/WebKit'},
+        ) as repo, mocks.local.Svn(), patch('webkitbugspy.Tracker._trackers', []):
+            self.add_stack(repo)
+            self.assertEqual(0, program.main(args=('stack', '--on', 'eng/parent'), path=self.path))
+            self.assertEqual(0, program.main(args=('pull-request', '--no-history'), path=self.path))
+
+            repo.edit_config('branch.eng/child.stack-parent', None)
+            repo.edit_config('branch.eng/child.stack-base', None)
+            repo.refs = {}
+
+            # This checkout has already replayed 'eng/child' onto main, so it has left the stack
+            repo.commits['eng/child'] = [
+                repo.commits[repo.default_branch][-1],
+                Commit(
+                    hash='b8b921baaad2fd10bc9d0cc9e97f8fa1d6e5f4a1',
+                    branch='eng/child',
+                    author=CONTRIBUTOR,
+                    identifier='5.1@eng/child',
+                    timestamp=1601669000,
+                    message='[Testing] Child change\n',
+                ),
+            ]
+            repo.head = repo.commits['eng/child'][-1]
+
+            self.assertEqual(0, program.main(args=('stack', '--rebase', '-v'), path=self.path))
+            self.assertIsNone(local.Git(self.path).config().get('branch.eng/child.stack-parent'))
+
+        self.assertIn(
+            "'eng/child' is published as stacked on 'eng/parent,' but has moved since",
+            captured.root.log.getvalue(),
+        )
+
+    def test_replaying_a_stack_this_checkout_has_never_seen(self) -> None:
+        with OutputCapture(), mocks.remote.GitHub() as github, mocks.local.Git(
+            self.path, remote=f'https://{github.remote}',
+            remotes={'fork': f'https://{github.hosts[0]}/Contributor/WebKit'},
+        ) as repo, mocks.local.Svn(), patch('webkitbugspy.Tracker._trackers', []):
+            self.add_stack(repo)
+            self.assertEqual(0, program.main(args=('stack', '--on', 'eng/parent'), path=self.path))
+            self.assertEqual(0, program.main(args=('pull-request', '--no-history'), path=self.path))
+
+            repo.edit_config('branch.eng/child.stack-parent', None)
+            repo.edit_config('branch.eng/child.stack-base', None)
+            repo.refs = {}
+
+            # Without the published stack this replays 'eng/child' onto main, swallowing its parent
+            self.assertEqual(0, program.main(args=('stack', '--rebase'), path=self.path))
+            self.assertEqual(repo.commits['eng/child'][0].hash, repo.commits['eng/parent'][-1].hash)
+
+    def test_a_published_parent_this_checkout_lacks_is_not_adopted(self) -> None:
+        with OutputCapture() as captured, mocks.remote.GitHub() as github, mocks.local.Git(
+            self.path, remote=f'https://{github.remote}',
+            remotes={'fork': f'https://{github.hosts[0]}/Contributor/WebKit'},
+        ) as repo, mocks.local.Svn(), patch('webkitbugspy.Tracker._trackers', []):
+            self.add_stack(repo)
+
+            # Published from a checkout which had a branch this one has never fetched
+            blob = 'f7c1bd87b90eab95798d2ac9d5e3b1a5e5f6d0c4'
+            repo.blobs[blob] = 'parent: eng/never-fetched\n'
+            repo.remote_refs['fork'] = {'refs/stacks/eng/child': blob}
+
+            self.assertEqual(0, program.main(args=('stack',), path=self.path))
+            self.assertIsNone(local.Git(self.path).config().get('branch.eng/child.stack-parent'))
+
+        self.assertEqual(captured.stdout.getvalue(), "'eng/child' is not part of a stack\n")
+
+    def test_unstacking_unpublishes_the_stack(self) -> None:
+        with OutputCapture(), mocks.remote.GitHub() as github, mocks.local.Git(
+            self.path, remote=f'https://{github.remote}',
+            remotes={'fork': f'https://{github.hosts[0]}/Contributor/WebKit'},
+        ) as repo, mocks.local.Svn(), patch('webkitbugspy.Tracker._trackers', []):
+            self.add_stack(repo)
+            self.assertEqual(0, program.main(args=('stack', '--on', 'eng/parent'), path=self.path))
+            self.assertEqual(0, program.main(args=('pull-request', '--no-history'), path=self.path))
+            self.assertIn('refs/stacks/eng/child', repo.remote_refs['fork'])
+
+            self.assertEqual(0, program.main(args=('stack', '--unstack'), path=self.path))
+            self.assertEqual(0, program.main(args=('pull-request', '--no-history'), path=self.path))
+            self.assertNotIn('refs/stacks/eng/child', repo.remote_refs['fork'])
+
+    def test_uploading_from_a_checkout_which_has_never_seen_the_stack(self) -> None:
+        with OutputCapture(), mocks.remote.GitHub() as github, mocks.local.Git(
+            self.path, remote=f'https://{github.remote}',
+            remotes={'fork': f'https://{github.hosts[0]}/Contributor/WebKit'},
+        ) as repo, mocks.local.Svn(), patch('webkitbugspy.Tracker._trackers', []):
+            self.add_stack(repo)
+            self.assertEqual(0, program.main(args=('stack', '--on', 'eng/parent'), path=self.path))
+            self.assertEqual(0, program.main(args=('pull-request', '--no-history'), path=self.path))
+
+            repo.edit_config('branch.eng/child.stack-parent', None)
+            repo.edit_config('branch.eng/child.stack-base', None)
+            repo.refs = {}
+
+            # Without the published stack this counts from main, so the parent's commit joins the pull-request
+            self.assertEqual(0, program.main(args=('pull-request', '--no-history'), path=self.path))
+            self.assertEqual(
+                local.Git(self.path).config().get('branch.eng/child.stack-parent'),
+                'eng/parent',
+            )
+            self.assertNotIn('[Testing] Parent change', github.pull_requests[0]['body'])
+
+    def test_pulling_a_stack_this_checkout_has_never_seen(self) -> None:
+        with OutputCapture(), mocks.remote.GitHub() as github, mocks.local.Git(
+            self.path, remote=f'https://{github.remote}',
+            remotes={'fork': f'https://{github.hosts[0]}/Contributor/WebKit'},
+        ) as repo, mocks.local.Svn(), patch('webkitbugspy.Tracker._trackers', []):
+            self.add_stack(repo)
+            self.assertEqual(0, program.main(args=('stack', '--on', 'eng/parent'), path=self.path))
+
+            repo.edit_config('branch.eng/child.stack-parent', None)
+            repo.edit_config('branch.eng/child.stack-base', None)
+            repo.refs = {}
+
+            # 'pull' decides whether to cascade from the stack's members, so it has to adopt first
+            self.assertEqual(0, program.main(args=('pull',), path=self.path))
+            config = local.Git(self.path).config()
+            self.assertEqual(config.get('branch.eng/child.stack-parent'), 'eng/parent')
+            self.assertEqual(repo.commits['eng/child'][0].hash, repo.commits['eng/parent'][-1].hash)
+
+    def test_retiring_a_landed_parent_unpublishes_the_stack(self) -> None:
+        with OutputCapture(), mocks.remote.GitHub() as github, mocks.local.Git(
+            self.path, remote=f'https://{github.remote}',
+            remotes={'fork': f'https://{github.hosts[0]}/Contributor/WebKit'},
+        ) as repo, mocks.local.Svn(), patch('webkitbugspy.Tracker._trackers', []):
+            self.add_stack(repo)
+            repo.head = repo.commits['eng/parent'][-1]
+            self.assertEqual(0, program.main(args=('pull-request', '--no-history'), path=self.path))
+
+            repo.head = repo.commits['eng/child'][-1]
+            self.assertEqual(0, program.main(args=('stack', '--on', 'eng/parent'), path=self.path))
+            self.assertIn('refs/stacks/eng/child', repo.remote_refs['fork'])
+
+            github.pull_requests[0]['merged'] = True
+            github.pull_requests[0]['head']['ref'] = 'eng/landed'
+            repo.edit_config('branch.eng/child.stack-parent', 'eng/landed')
+
+            # A retired dependency has to stop being published, or another checkout adopts it back
+            self.assertEqual(0, program.main(args=('stack', '--rebase'), path=self.path))
+            self.assertNotIn('refs/stacks/eng/child', repo.remote_refs['fork'])
+
+    def test_a_stack_is_published_to_the_fork_of_the_remote_it_targets(self) -> None:
+        with OutputCapture(), mocks.local.Git(
+            self.path, remotes={
+                'apple': 'https://github.example.com/apple/WebKit',
+                'apple-fork': 'https://github.example.com/Contributor/WebKit-apple',
+                'fork': 'https://github.example.com/Contributor/WebKit',
+            },
+        ) as repo, mocks.local.Svn(), patch('webkitbugspy.Tracker._trackers', []), MockTime:
+            self.add_stack(repo)
+            self.assertEqual(0, program.main(
+                args=('stack', '--on', 'eng/parent', '--remote', 'apple'),
+                path=self.path,
+            ))
+
+            # A pull-request against 'apple' is pushed to that remote's fork, so its stack goes there too
+            self.assertIn('refs/stacks/eng/child', repo.remote_refs.get('apple-fork', {}))
+            self.assertNotIn('refs/stacks/eng/child', repo.remote_refs.get('fork', {}))
+
+            repo.edit_config('branch.eng/child.stack-parent', None)
+            repo.edit_config('branch.eng/child.stack-base', None)
+            repo.refs = {}
+
+            self.assertEqual(0, program.main(args=('stack', '--remote', 'apple'), path=self.path))
+            self.assertEqual(
+                local.Git(self.path).config().get('branch.eng/child.stack-parent'),
+                'eng/parent',
+            )
+
+    def test_unstacking_from_a_checkout_which_has_never_seen_the_stack(self) -> None:
+        with OutputCapture(), mocks.remote.GitHub() as github, mocks.local.Git(
+            self.path, remote=f'https://{github.remote}',
+            remotes={'fork': f'https://{github.hosts[0]}/Contributor/WebKit'},
+        ) as repo, mocks.local.Svn(), patch('webkitbugspy.Tracker._trackers', []):
+            self.add_stack(repo)
+            self.assertEqual(0, program.main(args=('stack', '--on', 'eng/parent'), path=self.path))
+
+            repo.edit_config('branch.eng/child.stack-parent', None)
+            repo.edit_config('branch.eng/child.stack-base', None)
+            repo.refs = {}
+
+            # Unstacking has to reach the published record, or the branch stays stacked for everyone else
+            self.assertEqual(0, program.main(args=('stack', '--unstack'), path=self.path))
+            self.assertNotIn('refs/stacks/eng/child', repo.remote_refs['fork'])
+
+    def test_replaying_republishes_every_base_it_moved(self) -> None:
+        with OutputCapture(), mocks.remote.GitHub() as github, mocks.local.Git(
+            self.path, remote=f'https://{github.remote}',
+            remotes={'fork': f'https://{github.hosts[0]}/Contributor/WebKit'},
+        ) as repo, mocks.local.Svn(), patch('webkitbugspy.Tracker._trackers', []):
+            self.add_stack(repo)
+            repo.commits['eng/grandchild'] = [
+                repo.commits['eng/child'][-1],
+                Commit(
+                    hash='9e8d7c6b5a4f3e2d1c0b9a8f7e6d5c4b3a2f1e0d',
+                    branch='eng/grandchild',
+                    author=CONTRIBUTOR,
+                    identifier='5.3@eng/grandchild',
+                    timestamp=1601670000,
+                    message='[Testing] Grandchild change\n',
+                ),
+            ]
+            self.assertEqual(0, program.main(args=('stack', '--on', 'eng/parent'), path=self.path))
+            repo.head = repo.commits['eng/grandchild'][-1]
+            self.assertEqual(0, program.main(args=('stack', '--on', 'eng/child'), path=self.path))
+
+            # Review feedback on both, so every base beneath them moves
+            repo.commits['eng/parent'][-1] = Commit(
+                hash='4a3b2c1d0e9f8a7b6c5d4e3f2a1b0c9d8e7f6a5b',
+                branch='eng/parent',
+                author=CONTRIBUTOR,
+                identifier='5.1@eng/parent',
+                timestamp=1601668500,
+                message='[Testing] Parent change, revised\n',
+            )
+            repo.commits['eng/child'][-1] = Commit(
+                hash='1f2e3d4c5b6a7089f1e2d3c4b5a69788f9e0d1c2',
+                branch='eng/child',
+                author=CONTRIBUTOR,
+                identifier='5.2@eng/child',
+                timestamp=1601669500,
+                message='[Testing] Child change, revised\n',
+            )
+
+            self.assertEqual(0, program.main(args=('stack', '--rebase'), path=self.path))
+
+            # A base which is not republished is one nobody else can adopt, at any depth
+            config = local.Git(self.path).config()
+            for branch in ('eng/child', 'eng/grandchild'):
+                self.assertEqual(
+                    repo.blobs[repo.remote_refs['fork'][f'refs/stacks/{branch}']],
+                    f"parent: {config[f'branch.{branch}.stack-parent']}\n"
+                    f"base: {config[f'branch.{branch}.stack-base']}\n",
+                )
+
     def test_listing(self) -> None:
         with OutputCapture() as captured, mocks.local.Git(self.path) as repo, mocks.local.Svn(), \
                 patch('webkitbugspy.Tracker._trackers', []), MockTime:

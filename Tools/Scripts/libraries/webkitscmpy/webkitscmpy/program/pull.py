@@ -60,7 +60,7 @@ class Pull(Command):
                     remote = rmt
                     break
 
-            if (members := Stack.members(repository, repository.branch)) is None:
+            if (members := Stack.members(repository, repository.branch, remote=remote)) is None:
                 return 1
             if len(members) > 1:
                 return Stack.rebase(repository, remote=remote, prune=args.prune)

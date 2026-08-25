@@ -30,7 +30,7 @@ from typing import NamedTuple, Optional
 from .command import Command
 
 from webkitbugspy import Issue, Tracker, radar
-from webkitcorepy import arguments, run, Version
+from webkitcorepy import arguments, decorators, run, Version
 from webkitscmpy import Commit, PullRequest, local, log, remote
 
 
@@ -47,6 +47,7 @@ class Stack(Command):
 
     PARENT_KEY = 'stack-parent'
     BASE_KEY = 'stack-base'
+    METADATA_REFS = 'refs/stacks'
     HEADER = 'Stacked pull requests, bottom of the stack first:'
     UPDATE_REFS_VERSION = Version(2, 38)
     PULL_REQUEST_RE = re.compile(r'(?:^|/pull/)(?P<number>\d+)(?:/|$)')
@@ -147,12 +148,14 @@ class Stack(Command):
     @classmethod
     def forget_landed_parent(cls, git: local.Git, branch: Optional[str], remote: Optional[str] = None) -> bool:
         """Drop a dependency on a parent which landed, since the production branch now carries it."""
+        cls._adopt_metadata(git, remote=remote, branch=branch)
         parent = cls.recorded_parent(git, branch)
         if not parent or cls.parent(git, branch) or not cls._parent_landed(git, parent, remote):
             return False
         if cls._unset_parent(git, branch):
             return False
 
+        cls.push_metadata(git, branch, remote=remote)
         print(f"'{parent}' has landed, so '{branch}' is no longer stacked on it")
         return True
 
@@ -203,7 +206,8 @@ class Stack(Command):
         return result
 
     @classmethod
-    def members(cls, git: local.Git, branch: str) -> Optional[list[str]]:
+    def members(cls, git: local.Git, branch: str, remote: Optional[str] = None) -> Optional[list[str]]:
+        cls._adopt_metadata(git, remote=remote, branch=branch)
         if (below := cls._ancestors(git, branch)) is None:
             return None
         root = below[0] if below else branch
@@ -223,8 +227,11 @@ class Stack(Command):
         return PullRequestCommand.find_existing_pull_request(git, remote_repo, branch=branch)
 
     @classmethod
-    def describe(cls, git: local.Git, branch: str, remote_repo: Optional[remote.Scm] = None) -> Optional[list[str]]:
-        if (members := cls.members(git, branch)) is None:
+    def describe(
+        cls, git: local.Git, branch: str,
+        remote_repo: Optional[remote.Scm] = None, remote: Optional[str] = None,
+    ) -> Optional[list[str]]:
+        if (members := cls.members(git, branch, remote=remote)) is None:
             return None
         if len(members) < 2:
             return []
@@ -304,7 +311,7 @@ class Stack(Command):
         cls.forget_landed_parent(git, branch, remote=remote)
         if cls.missing_parent(git, branch):
             return 1
-        if (members := cls.members(git, branch)) is None:
+        if (members := cls.members(git, branch, remote=remote)) is None:
             return 1
 
         remote = remote or git.default_remote
@@ -333,6 +340,7 @@ class Stack(Command):
         for member in members[1:]:
             if cls._set_base(git, member, cls.parent(git, member)):
                 return 1
+        cls.push_metadata(git, *members[1:], remote=remote)
 
         # CLEANUP
         command = [git.executable(), 'checkout', branch]
@@ -520,12 +528,113 @@ class Stack(Command):
         return 0
 
     @classmethod
-    def stack_on(cls, git: local.Git, branch: str, parent: str) -> int:
+    def _metadata_remote(cls, git: local.Git, remote: Optional[str]) -> str:
+        """The remote a contributor can push to, which is the only place their stacks can be published."""
+        from .pull_request import PullRequest as PullRequestCommand
+
+        remote = remote or git.default_remote
+        fork = PullRequestCommand.fork_remote_for(git, remote)
+        return fork if git.config().get(f'remote.{fork}.url') else remote
+
+    @classmethod
+    def _metadata_ref(cls, branch: str) -> str:
+        return f'{cls.METADATA_REFS}/{branch}'
+
+    @classmethod
+    def _read_metadata(cls, git: local.Git, branch: str) -> dict:
+        result = run(
+            [git.executable(), 'cat-file', 'blob', cls._metadata_ref(branch)],
+            cwd=git.root_path, capture_output=True, encoding='utf-8',
+        )
+        if result.returncode:
+            return {}
+        return {
+            key.strip(): value.strip()
+            for key, _, value in (line.partition(':') for line in result.stdout.splitlines())
+            if value.strip()
+        }
+
+    @classmethod
+    def push_metadata(cls, git: local.Git, *branches: str, remote: Optional[str] = None) -> None:
+        """Publish where branches sit in their stack, which no other checkout can work out for itself."""
+        refspecs = []
+        for branch in branches:
+            ref = cls._metadata_ref(branch)
+            content = ''.join(f'{key}: {value}\n' for key, value in (
+                ('parent', cls.recorded_parent(git, branch)),
+                ('base', cls._base(git, branch)),
+            ) if value)
+
+            if content:
+                blob = run(
+                    [git.executable(), 'hash-object', '-w', '--stdin'],
+                    cwd=git.root_path, capture_output=True, encoding='utf-8', input=content,
+                )
+                if blob.returncode or run(
+                    [git.executable(), 'update-ref', ref, blob.stdout.strip()],
+                    cwd=git.root_path, capture_output=True,
+                ).returncode:
+                    log.warning(f"Failed to record where '{branch}' sits in its stack")
+                    continue
+                refspecs.append(f'{ref}:{ref}')
+            elif cls._read_metadata(git, branch):
+                run([git.executable(), 'update-ref', '-d', ref], cwd=git.root_path, capture_output=True)
+                refspecs.append(f':{ref}')
+
+        if not refspecs:
+            return
+
+        # A blob has no history, so git will not move a published ref onto one without being forced
+        command = [git.executable(), 'push', '-f', cls._metadata_remote(git, remote)] + refspecs
+        if run(command, cwd=git.root_path, capture_output=True).returncode:
+            log.warning(f"Failed to publish {len(refspecs)} stack(s), other checkouts will not see them")
+
+    @classmethod
+    @decorators.Memoize()
+    def _adopt_metadata(cls, git: local.Git, remote: Optional[str] = None, branch: Optional[str] = None) -> None:
+        """Take the stacks a checkout has never seen from the remote they were published to."""
+        if branch and cls.recorded_parent(git, branch):
+            return
+
+        prefix = f'{cls.METADATA_REFS}/'
+        command = [git.executable(), 'fetch', cls._metadata_remote(git, remote), f'+{prefix}*:{prefix}*']
+
+        # Nothing else here needs the remote, so a checkout which cannot reach it carries on unstacked
+        if run(command, cwd=git.root_path, capture_output=True).returncode:
+            log.info(f"Failed to look up published stacks on '{cls._metadata_remote(git, remote)}'")
+            return
+
+        published = run(
+            [git.executable(), 'for-each-ref', '--format', '%(refname)', prefix],
+            cwd=git.root_path, capture_output=True, encoding='utf-8',
+        )
+        branches = git.branches_for(remote=False)
+        for candidate in [ref[len(prefix):] for ref in published.stdout.splitlines()]:
+            if candidate not in branches or cls.recorded_parent(git, candidate):
+                continue
+            metadata = cls._read_metadata(git, candidate)
+            parent, base = metadata.get('parent'), metadata.get('base')
+            if not parent or parent not in branches:
+                continue
+
+            # A published base which is no longer behind the branch describes a stack this checkout has left
+            if base and run(
+                [git.executable(), 'merge-base', '--is-ancestor', base, candidate],
+                cwd=git.root_path, capture_output=True,
+            ).returncode:
+                log.warning(f"'{candidate}' is published as stacked on '{parent},' but has moved since")
+                continue
+            if not cls._record_parent(git, candidate, parent, base=base):
+                print(f"'{candidate}' is stacked on '{parent}'")
+
+    @classmethod
+    def stack_on(cls, git: local.Git, branch: str, parent: str, remote: Optional[str] = None) -> int:
         """Record that 'branch' is stacked on 'parent,' and put it there."""
         previous, base = cls.parent(git, branch), cls._base(git, branch)
         if cls._set_parent(git, branch, parent):
             return 1
         if not cls._restack(git, branch, parent):
+            cls.push_metadata(git, branch, remote=remote)
             return 0
 
         # A conflict leaves the replay to be finished by hand, so the parent it will sit on stays
@@ -584,17 +693,19 @@ class Stack(Command):
                     f"'{parent}' is stacked on '{branch},' stacking '{branch}' on it would create a cycle\n"
                 )
                 return 1
-            if cls.stack_on(git, branch, parent):
+            if cls.stack_on(git, branch, parent, remote=args.remote):
                 return 1
             print(f"'{branch}' is stacked on '{parent}'")
             return 0 if args.rebase is False else cls.rebase(git, remote=args.remote)
 
         if args.unstack:
+            cls._adopt_metadata(git, remote=args.remote, branch=branch)
             if parent := cls.parent(git, branch):
                 cls.unrelate_issues(git, branch, parent)
             was_stacked = bool(parent)
             if cls._unset_parent(git, branch):
                 return 1
+            cls.push_metadata(git, branch, remote=args.remote)
             print(f"'{branch}' is no longer stacked on another branch")
 
             # Nothing sits beneath it any more, so replay it onto the branch it will be merged into
@@ -606,7 +717,7 @@ class Stack(Command):
             return result
 
         remote_repo = git.remote(name=args.remote or git.default_remote)
-        if (lines := cls.describe(git, branch, remote_repo=remote_repo)) is None:
+        if (lines := cls.describe(git, branch, remote_repo=remote_repo, remote=args.remote)) is None:
             return 1
         if not lines:
             print(f"'{branch}' is not part of a stack")

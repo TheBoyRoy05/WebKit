@@ -304,7 +304,7 @@ class PullRequest(Command):
                 args, repository,
                 why="'{}' is not a pull request branch".format(repository.branch),
                 redact=source_remote != repository.default_remote,
-                target_remote='fork' if source_remote == repository.default_remote else '{}-fork'.format(source_remote),
+                target_remote=cls.fork_remote_for(repository, source_remote),
                 **kwargs
             ):
                 sys.stderr.write("Abandoning pushing pull-request because '{}' could not be created\n".format(args.issue))
@@ -480,6 +480,11 @@ class PullRequest(Command):
             elif commit_class != 'Gardening':
                 issue.open(why='Re-opening for {} {}'.format(pr_label.lower(), pr.url))
             print('Posted pull request link to {}'.format(issue.link))
+
+    @classmethod
+    def fork_remote_for(cls, repository, source_remote):
+        """The remote a contributor pushes branches to, which pull-requests against 'source_remote' come from."""
+        return 'fork' if source_remote == repository.default_remote else f'{source_remote}-fork'
 
     @classmethod
     def ensure_stack_parent(cls, args, repository):
@@ -674,7 +679,7 @@ class PullRequest(Command):
             sys.stderr.write("Failed to set the target of '{}' to '{}'\n".format(repository.branch, source_remote))
 
         if isinstance(remote_repo, remote.GitHub):
-            target = 'fork' if source_remote == repository.default_remote else '{}-fork'.format(source_remote)
+            target = cls.fork_remote_for(repository, source_remote)
             if not repository.config().get('remote.{}.url'.format(target)):
                 sys.stderr.write("'{}' is not a remote in this repository. Have you run `{} setup` yet?\n".format(
                     source_remote, os.path.basename(sys.argv[0]),
@@ -800,6 +805,8 @@ class PullRequest(Command):
             sys.stderr.write("Your checkout may be mis-configured, try re-running 'git-webkit setup' or\n")
             sys.stderr.write("your checkout may not have permission to push to '{}'\n".format(repository.url(name=target)))
             return 1
+
+        Stack.push_metadata(repository, repository.branch, remote=source_remote)
 
         if args.history or (target != source_remote and args.history is None and args.technique == 'overwrite'):
             regex = re.compile(r'^{}-(?P<count>\d+)$'.format(repository.branch))

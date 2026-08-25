@@ -101,6 +101,11 @@ class Git(mocks.Subprocess):
 
         self.tags = {}
 
+        # Refs outside 'refs/heads' which point at blobs, keyed by remote for what has been published
+        self.blobs = {}
+        self.refs = {}
+        self.remote_refs = {}
+
         self.staged = {}
         self.modified = {}
         self.revert_message = None
@@ -663,6 +668,26 @@ nothing to commit, working tree clean
                 self.executable, 'show-ref', '--verify', '--quiet', re.compile(r'.+'),
                 cwd=self.path,
                 generator=lambda *args, **kwargs: self.show_ref_verify(args[4]),
+            ), mocks.Subprocess.Route(
+                self.executable, 'hash-object', '-w', '--stdin',
+                cwd=self.path,
+                generator=lambda *args, **kwargs: self.hash_object(kwargs.get('input')),
+            ), mocks.Subprocess.Route(
+                self.executable, 'cat-file', 'blob', re.compile(r'.+'),
+                cwd=self.path,
+                generator=lambda *args, **kwargs: self.cat_file(args[3]),
+            ), mocks.Subprocess.Route(
+                self.executable, 'update-ref', '-d', re.compile(r'.+'),
+                cwd=self.path,
+                generator=lambda *args, **kwargs: self.delete_ref(args[3]),
+            ), mocks.Subprocess.Route(
+                self.executable, 'push', '-f', re.compile(r'.+'), re.compile(r':?refs/(?!heads/).+'),
+                cwd=self.path,
+                generator=lambda *args, **kwargs: self.push_refs(args[3], *args[4:]),
+            ), mocks.Subprocess.Route(
+                self.executable, 'fetch', re.compile(r'.+'), re.compile(r'\+?refs/(?!heads/).+:.+'),
+                cwd=self.path,
+                generator=lambda *args, **kwargs: self.fetch_refs(args[2], args[3]),
             ), mocks.Subprocess.Route(
                 self.executable, 'push', '--porcelain', re.compile(r'.+'), re.compile(r'.+'),
                 cwd=self.path,
@@ -1683,6 +1708,10 @@ nothing to commit, working tree clean
         return mocks.ProcessCompletion(returncode=0 if any(commit.hash == ancestor_commit.hash for commit in self.rev_list(descendent)) else 1)
 
     def update_ref(self, ref, value):
+        if value in self.blobs:
+            self.refs[ref] = value
+            return mocks.ProcessCompletion(returncode=0)
+
         commit = self.find(value)
         if not commit:
             return mocks.ProcessCompletion(
@@ -1697,6 +1726,55 @@ nothing to commit, working tree clean
             )
         if commit not in self.remotes[remote_ref]:
             self.remotes[remote_ref] = list(reversed(self.rev_list(value)))
+        return mocks.ProcessCompletion(returncode=0)
+
+    def delete_ref(self, ref):
+        # git does not mind being asked to delete a ref which is already gone
+        self.refs.pop(ref, None)
+        return mocks.ProcessCompletion(returncode=0)
+
+    def hash_object(self, content):
+        content = string_utils.decode(content)
+        blob = hashlib.sha1(f'blob {len(content)}\0{content}'.encode('utf-8')).hexdigest()
+        self.blobs[blob] = content
+        return mocks.ProcessCompletion(returncode=0, stdout=f'{blob}\n')
+
+    def cat_file(self, argument):
+        blob = self.refs.get(argument, argument)
+        if blob not in self.blobs:
+            return mocks.ProcessCompletion(
+                returncode=128,
+                stderr=f'fatal: Not a valid object name {argument}\n',
+            )
+        return mocks.ProcessCompletion(returncode=0, stdout=self.blobs[blob])
+
+    def push_refs(self, remote, *refspecs):
+        """Publish, or delete, refs which are not branches."""
+        published = self.remote_refs.setdefault(remote, {})
+        for refspec in refspecs:
+            source, _, destination = refspec.partition(':')
+            if not source:
+                published.pop(destination, None)
+                continue
+            if source not in self.refs:
+                return mocks.ProcessCompletion(
+                    returncode=1,
+                    stderr=f'error: src refspec {source} does not match any\n',
+                )
+            published[destination] = self.refs[source]
+        return mocks.ProcessCompletion(returncode=0)
+
+    def fetch_refs(self, remote, refspec):
+        source, _, destination = refspec.lstrip('+').partition(':')
+        prefix, suffix = source.rstrip('*'), destination.rstrip('*')
+        matching = {
+            f'{suffix}{ref[len(prefix):]}': blob
+            for ref, blob in self.remote_refs.get(remote, {}).items() if ref.startswith(prefix)
+        }
+        # A wildcard which matches nothing is not an error, naming a ref which is gone is
+        if not matching and '*' not in source:
+            return mocks.ProcessCompletion(returncode=128, stderr=f"fatal: couldn't find remote ref {source}\n")
+        self.refs.update(matching)
         return mocks.ProcessCompletion(returncode=0)
 
 
@@ -1723,7 +1801,7 @@ nothing to commit, working tree clean
         else:
             candidate_refs = [f'refs/heads/{branch}' for branch in sorted(self.commits)] + [
                 f'refs/remotes/{branch}' for branch in sorted(self.remotes)
-            ]
+            ] + sorted(self.refs)
 
         patterns_re = re.compile(
             '|'.join(
@@ -1731,7 +1809,7 @@ nothing to commit, working tree clean
                     (
                         fnmatch.translate(pattern),
                         re.escape(pattern) + r'\Z',
-                        re.escape(pattern) + '/',
+                        re.escape(pattern.rstrip('/')) + '/',
                     )
                     for pattern in patterns
                 )
